@@ -38,6 +38,7 @@ class MultiheadAttention(nn.Module):
         encoder_decoder_attention=False,
         q_noise=0.0,
         qn_block_size=8,
+        simple_attention=False,	
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -58,6 +59,8 @@ class MultiheadAttention(nn.Module):
 
         self.self_attention = self_attention
         self.encoder_decoder_attention = encoder_decoder_attention
+        self.simple_attention = simple_attention
+        print(f"Simple attention: {self.simple_attention}", flush=True)	
 
         assert not self.self_attention or self.qkv_same_dim, (
             "Self-attention requires query, key and " "value to be of the same size"
@@ -303,6 +306,7 @@ class MultiheadAttention(nn.Module):
             # Since pruning will break the dimension check and it is not easy to modify the pytorch API,
             # it is preferred to bypass the pytorch MHA when we need to skip embed_dim_check
             and not self.skip_embed_dim_check
+            and not self.simple_attention
         ):
             assert key is not None and value is not None
             return F.multi_head_attention_forward(
@@ -359,7 +363,13 @@ class MultiheadAttention(nn.Module):
             q = self.q_proj(query)
             k = self.k_proj(key)
             v = self.v_proj(value)
-        q *= self.scaling
+
+        if self.simple_attention:
+            q *= tgt_len**-0.5
+            q = F.relu(q)
+            k = F.relu(k)
+        else:
+            q *= self.scaling
 
         if self.bias_k is not None:
             assert self.bias_v is not None
@@ -476,28 +486,42 @@ class MultiheadAttention(nn.Module):
             attn_mask = attn_mask.unsqueeze(0)
             if self.onnx_trace:
                 attn_mask = attn_mask.repeat(attn_weights.size(0), 1, 1)
-            attn_weights += attn_mask
+
+            if self.simple_attention:
+                attn_mask_bool = attn_mask.to(torch.bool)
+                attn_weights = attn_weights.masked_fill(attn_mask_bool, 0)
+            else:
+                attn_weights += attn_mask
 
         if key_padding_mask is not None:
             # don't attend to padding symbols
             attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
             if not is_tpu:
-                attn_weights = attn_weights.masked_fill(
-                    key_padding_mask.unsqueeze(1).unsqueeze(2).to(torch.bool),
-                    float("-inf"),
-                )
+                key_pad_mask_unsqueeze = key_padding_mask.unsqueeze(1).unsqueeze(2).to(torch.bool)
+                if self.simple_attention:
+                    attn_weights = attn_weights.masked_fill(key_pad_mask_unsqueeze, 0)
+                else:
+                    attn_weights = attn_weights.masked_fill(key_pad_mask_unsqueeze, float("-inf"))
             else:
                 attn_weights = attn_weights.transpose(0, 2)
-                attn_weights = attn_weights.masked_fill(key_padding_mask, float("-inf"))
+                if self.simple_attention:
+                    attn_weights = attn_weights.masked_fill(key_padding_mask, 0)
+                else:
+                    attn_weights = attn_weights.masked_fill(key_padding_mask, float("-inf"))
                 attn_weights = attn_weights.transpose(0, 2)
             attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
 
         if before_softmax:
             return attn_weights, v
 
-        attn_weights_float = utils.softmax(
-            attn_weights, dim=-1, onnx_trace=self.onnx_trace
-        )
+        if self.simple_attention:
+            attn_weights_float = attn_weights.type(torch.float32)
+            #print(f"attn_weights_float w/o softmax: {attn_weights_float}, type={attn_weights_float.type()}", flush=True)
+        else:
+            attn_weights_float = utils.softmax(
+                attn_weights, dim=-1, onnx_trace=self.onnx_trace
+            )
+            #print(f"attn_weights_float w/ softmax: {attn_weights_float}, type={attn_weights_float.type()}", flush=True)
         attn_weights = attn_weights_float.type_as(attn_weights)
         attn_probs = self.dropout_module(attn_weights)
 

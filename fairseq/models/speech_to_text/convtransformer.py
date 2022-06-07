@@ -182,6 +182,11 @@ class ConvTransformerModel(FairseqEncoderDecoderModel):
             help=":The list of sharing layers for both feed-forward network and attention. The range of layer number starts from 1, and the layer number which is over the range would not work.",
         )
         # th-code
+        parser.add_argument(
+            "--simple-attention",
+            action="store_true",
+            help="if True, use simple attention without softmax as proposed by https://arxiv.org/pdf/2111.15588.pdf",
+        )
 
     @classmethod
     def build_encoder(cls, args):

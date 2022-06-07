@@ -230,6 +230,10 @@ class TransformerConfig(FairseqDataclass):
         default=None,	
         metadata={"help": "List of decoder layers that share feed-forward & attention weights --- acceptable values = 1 ... decoder_layers"},
     )
+    simple_attention: bool = field(
+        default=False,
+        metadata={"help": "Use simple attention without softmax, as proposed by https://arxiv.org/pdf/2111.15588.pdf"},
+    )
 
 
     # We need to make this hierarchical dataclass like the flat namespace
