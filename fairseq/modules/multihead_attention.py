@@ -365,7 +365,7 @@ class MultiheadAttention(nn.Module):
             v = self.v_proj(value)
 
         if self.simple_attention:
-            q *= tgt_len**-0.5
+            #q *= tgt_len**-0.5
             q = F.relu(q)
             k = F.relu(k)
         else:
@@ -516,12 +516,13 @@ class MultiheadAttention(nn.Module):
 
         if self.simple_attention:
             attn_weights_float = attn_weights.type(torch.float32)
-            #print(f"attn_weights_float w/o softmax: {attn_weights_float}, type={attn_weights_float.type()}", flush=True)
+            denom = torch.clamp_min(attn_weights_float.sum(dim=-1, keepdim=True), 0.1)
+            #print(f"Denom: {denom}", flush=True)
+            attn_weights_float = attn_weights_float / denom
         else:
             attn_weights_float = utils.softmax(
                 attn_weights, dim=-1, onnx_trace=self.onnx_trace
             )
-            #print(f"attn_weights_float w/ softmax: {attn_weights_float}, type={attn_weights_float.type()}", flush=True)
         attn_weights = attn_weights_float.type_as(attn_weights)
         attn_probs = self.dropout_module(attn_weights)
 
