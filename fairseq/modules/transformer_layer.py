@@ -145,12 +145,13 @@ class TransformerEncoderLayerBase(nn.Module):
             q_noise=self.quant_noise,
             qn_block_size=self.quant_noise_block_size,
             simple_attention=cfg.simple_attention,
-            cosformer_attn_enable=cfg.cosformer_attn_enable,
+            #cosformer_attn_enable=cfg.cosformer_attn_enable,
             cosformer_expt_attn_enable=cfg.cosformer_expt_attn_enable,
             combin_attn_enable=cfg.combin_attn_enable,
             combin_expt_attn_enable=cfg.combin_expt_attn_enable,
             enable_norm_stretch_factor=(not cfg.disable_norm_stretch_factor),
-            max_src_len_step_size=cfg.max_src_len_step_size,
+            max_src_len_step_size=128,
+            #shortened_expt_simil=cfg.shortened_expt_simil,
         )
 
     def residual_connection(self, x, residual):
@@ -380,6 +381,7 @@ class TransformerDecoderLayerBase(nn.Module):
             combin_expt_attn_enable=cfg.combin_expt_attn_enable,
             enable_norm_stretch_factor=(not cfg.disable_norm_stretch_factor),
             max_src_len_step_size=cfg.max_src_len_step_size,
+            shortened_expt_simil=cfg.shortened_expt_simil,
         )
 
     def build_encoder_attention(self, embed_dim, cfg):
@@ -392,7 +394,7 @@ class TransformerDecoderLayerBase(nn.Module):
             encoder_decoder_attention=True,
             q_noise=self.quant_noise,
             qn_block_size=self.quant_noise_block_size,
-            simple_attention=cfg.simple_attention,
+            #simple_attention=cfg.simple_attention,
             #cosformer_attn_enable=cfg.cosformer_attn_enable,
         )
 

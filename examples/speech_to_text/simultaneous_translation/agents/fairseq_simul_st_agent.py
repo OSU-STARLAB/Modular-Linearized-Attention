@@ -7,6 +7,7 @@ import torchaudio.compliance.kaldi as kaldi
 import yaml
 from fairseq import checkpoint_utils, tasks
 from fairseq.file_io import PathManager
+import copy
 
 try:
     from simuleval import READ_ACTION, WRITE_ACTION, DEFAULT_EOS
@@ -160,36 +161,46 @@ class FairseqSimulSTAgent(SpeechAgent):
         self.cosformer_expt_attn_enable = args.cosformer_expt_attn_enable
         self.combin_attn_enable = args.combin_attn_enable
         self.combin_expt_attn_enable = args.combin_expt_attn_enable
+        self.simple_attention = args.simple_attention
 
         self.load_simul_attn_chkpts = args.load_simul_attn_chkpts
 
         self.max_src_len_step_size = args.max_src_len_step_size
-       
+      
         # used to initialize transformations as a LUT for fully linearized attention
         self.chkpt_tr_inter = {}
         if self.load_simul_attn_chkpts:
-            idx = torch.zeros(768)
-            for i in range(768):
-                idx[i] = i
+            idx = torch.arange(1, 768 + 1)
             
-            loop_len = math.ceil(768 / self.max_src_len_step_size)
+            step = self.max_src_len_step_size
+            loop_len = math.ceil((768 + step / 10) / step)
 
-            if self.cosformer_attn_enable:
-                self.chkpt_tr_inter["sin_tr"] = {}
-                self.chkpt_tr_inter["cos_tr"] = {}
+            if self.cosformer_attn_enable or self.simple_attention:
+                temp_idx = torch.zeros(768)
+                bound_l = 0
                 for i in range(loop_len):
-                    self.chkpt_tr_inter["sin_tr"][i] = torch.sin((3.1415*idx+0.001)/(2*(i + 1)*self.max_src_len_step_size))
-                    self.chkpt_tr_inter["cos_tr"][i] = torch.cos((3.1415*idx+0.001)/(2*(i + 1)*self.max_src_len_step_size))
+                    bound_h = min(math.ceil((i + 1) * step - step/10), 768)
+                    temp_idx[bound_l:bound_h] = idx[bound_l:bound_h] / ((i + 1) * step)
+                    bound_l = bound_h
+
+                self.chkpt_tr_inter["sin_tr"] = torch.sin((math.pi / 2) * temp_idx)
+                self.chkpt_tr_inter["cos_tr"] = torch.cos((math.pi / 2) * temp_idx)
+            
             elif self.cosformer_expt_attn_enable:
-                self.chkpt_tr_inter["sin_tr"] = torch.sin((3.1415*(1 - torch.exp(-1 * idx)+0.001)/2)
-                self.chkpt_tr_inter["cos_tr"] = torch.cos((3.1415*(1 - torch.exp(-1 * idx)+0.001)/2)
+                self.chkpt_tr_inter["sin_tr"] = torch.sin((math.pi/2)*(1 - torch.exp(-1 * idx)))
+                self.chkpt_tr_inter["cos_tr"] = torch.cos((math.pi/2)*(1 - torch.exp(-1 * idx)))
+            
             elif self.combin_attn_enable:
-                self.chkpt_tr_inter["j_tr"] = {}
-                self.chkpt_tr_inter["j_ttr"] = {}
+                temp_idx = torch.zeros(768)
+                bound_l = 0
                 for i in range(loop_len):
-                    temp_idx = (idx[:((i + 1)*self.max_src_len_step_size)] + 0.1) / ((i + 1) * self.max_src_len_step_size)
-                    self.chkpt_tr_inter["j_tr"][i] = temp_idx
-                    self.chkpt_tr_inter["j_ttr"][i] = torch.square(temp_idx)
+                    bound_h = min(math.ceil((i + 1) * step - step/10), 768)
+                    temp_idx[bound_l:bound_h] = (idx[bound_l:bound_h] + 0.1) / ((i + 1) * step)
+                    bound_l = bound_h
+
+                self.chkpt_tr_inter["j_tr"] = temp_idx
+                self.chkpt_tr_inter["j_ttr"] = torch.square(temp_idx)
+            
             elif self.combin_expt_attn_enable:
                 self.chkpt_tr_inter["j_tr"] = torch.exp(-1 * idx)
                 self.chkpt_tr_inter["j_ttr"] = torch.exp(-2 * idx)
@@ -251,16 +262,20 @@ class FairseqSimulSTAgent(SpeechAgent):
                             help="Method used to flush state after each sentence and enable more continuous operation.")
         parser.add_argument("--cosformer-attn-enable", default=False, action="store_true",
                             help="Switch to enable cosformer-attn during inference.")
-        parser.add_argument("--cosformer_expt-attn-enable", default=False, action="store_true",
+        parser.add_argument("--cosformer-expt-attn-enable", default=False, action="store_true",
                             help="Switch to enable cosformer_expt-attn during inference.")
         parser.add_argument("--combin-attn-enable", default=False, action="store_true",
                             help="Switch to enable combin-attn during inference.")
         parser.add_argument("--combin-expt-attn-enable", default=False, action="store_true",
                             help="Switch to enable combin-expt-attn during inference.")
+        parser.add_argument("--simple-attention", default=False, action="store_true",
+                            help="Switch to enable simple attention during inference.")
         parser.add_argument("--load-simul-attn-chkpts", default=False, action="store_true",
                             help="Switch to enable fully linearized attention at inference.")
         parser.add_argument("--max-src-len-step-size", type=int, default=128,
                             help="Max length stepping size in attention calculations at inference. Useful for quadratic/fully linearized inference.")
+        parser.add_argument("--tgt-len-mod", type=float, default=0.25,
+                            help="Target length ratio for length estimation purposes, applied towards cosformer.")
         # fmt: on
         return parser
 
@@ -315,21 +330,15 @@ class FairseqSimulSTAgent(SpeechAgent):
             
             loop_len = math.ceil(768 / self.max_src_len_step_size)
 
-            if self.cosformer_attn_enable:
-                self.simul_attn_chkpts["sin_tr"] = {}
-                self.simul_attn_chkpts["cos_tr"] = {}
-                for i in range(loop_len):
-                    self.simul_attn_chkpts["sin_tr"][i] = self.chkpt_tr_inter["sin_tr"][i]
-                    self.simul_attn_chkpts["cos_tr"][i] = self.chkpt_tr_inter["cos_tr"][i]
+            if self.cosformer_attn_enable or self.simple_attention:
+                self.simul_attn_chkpts["sin_tr"] = self.chkpt_tr_inter["sin_tr"]
+                self.simul_attn_chkpts["cos_tr"] = self.chkpt_tr_inter["cos_tr"]
             elif self.cosformer_expt_attn_enable:
-                self.chkpt_tr_inter["sin_tr"] = self.chkpt_tr_inter["sin_tr"]
-                self.chkpt_tr_inter["cos_tr"] = self.chkpt_tr_inter["cos_tr"]
+                self.simul_attn_chkpts["sin_tr"] = self.chkpt_tr_inter["sin_tr"]
+                self.simul_attn_chkpts["cos_tr"] = self.chkpt_tr_inter["cos_tr"]
             elif self.combin_attn_enable:
-                self.simul_attn_chkpts["j_tr"] = {}
-                self.simul_attn_chkpts["j_ttr"] = {}
-                for i in range(loop_len):
-                    self.simul_attn_chkpts["j_tr"][i] = self.chkpt_tr_inter["j_tr"][i]
-                    self.simul_attn_chkpts["j_ttr"][i] = self.chkpt_tr_inter["j_ttr"][i]
+                self.simul_attn_chkpts["j_tr"] = self.chkpt_tr_inter["j_tr"]
+                self.simul_attn_chkpts["j_ttr"] = self.chkpt_tr_inter["j_ttr"]
             elif self.combin_expt_attn_enable:
                 self.simul_attn_chkpts["j_tr"] = self.chkpt_tr_inter["j_tr"]
                 self.simul_attn_chkpts["j_ttr"] = self.chkpt_tr_inter["j_tr"]
@@ -342,13 +351,21 @@ class FairseqSimulSTAgent(SpeechAgent):
                 self.simul_attn_chkpts["layers"][i]["self_attn"] = {}
                 self.simul_attn_chkpts["layers"][i]["cross_attn"] = {}
                 
-                if self.cosformer_attn_enable or self.cosformer_expt_attn_enable:
+                if self.cosformer_attn_enable or self.cosformer_expt_attn_enable or self.simple_attention:
                     self.simul_attn_chkpts["layers"][i]["self_attn"]["norm_sin"] = None
                     self.simul_attn_chkpts["layers"][i]["self_attn"]["norm_cos"] = None
                     self.simul_attn_chkpts["layers"][i]["self_attn"]["k_sin"] = None
                     self.simul_attn_chkpts["layers"][i]["self_attn"]["k_cos"] = None
+                    self.simul_attn_chkpts["layers"][i]["self_attn"]["v"] = None
                     self.simul_attn_chkpts["layers"][i]["self_attn"]["kTv_sin"] = None
                     self.simul_attn_chkpts["layers"][i]["self_attn"]["kTv_cos"] = None
+                    self.simul_attn_chkpts["layers"][i]["cross_attn"]["norm_sin"] = None
+                    self.simul_attn_chkpts["layers"][i]["cross_attn"]["norm_cos"] = None
+                    self.simul_attn_chkpts["layers"][i]["cross_attn"]["k_sin"] = None
+                    self.simul_attn_chkpts["layers"][i]["cross_attn"]["k_cos"] = None
+                    self.simul_attn_chkpts["layers"][i]["cross_attn"]["v"] = None
+                    self.simul_attn_chkpts["layers"][i]["cross_attn"]["kTv_sin"] = None
+                    self.simul_attn_chkpts["layers"][i]["cross_attn"]["kTv_cos"] = None
                 elif self.combin_attn_enable or self.combin_expt_attn_enable:
                     self.simul_attn_chkpts["layers"][i]["self_attn"]["norm"] = None
                     self.simul_attn_chkpts["layers"][i]["self_attn"]["norm_t"] = None
@@ -358,7 +375,17 @@ class FairseqSimulSTAgent(SpeechAgent):
                     self.simul_attn_chkpts["layers"][i]["self_attn"]["attn_weights"] = None
                     self.simul_attn_chkpts["layers"][i]["self_attn"]["attn_weights_kt"] = None
                     self.simul_attn_chkpts["layers"][i]["self_attn"]["attn_weights_ktt"] = None
+                    self.simul_attn_chkpts["layers"][i]["cross_attn"]["norm"] = None
+                    self.simul_attn_chkpts["layers"][i]["cross_attn"]["norm_t"] = None
+                    self.simul_attn_chkpts["layers"][i]["cross_attn"]["norm_tt"] = None
+                    self.simul_attn_chkpts["layers"][i]["cross_attn"]["k_t"] = None
+                    self.simul_attn_chkpts["layers"][i]["cross_attn"]["k_tt"] = None
+                    self.simul_attn_chkpts["layers"][i]["cross_attn"]["attn_weights"] = None
+                    self.simul_attn_chkpts["layers"][i]["cross_attn"]["attn_weights_kt"] = None
+                    self.simul_attn_chkpts["layers"][i]["cross_attn"]["attn_weights_ktt"] = None
 
+        self.simul_attn_chkpts["save_k_v_cross"] = False
+        
         self.simul_attn_chkpts["old_indices"] = {
             "src": 0,
             "tgt": 0,
@@ -436,11 +463,14 @@ class FairseqSimulSTAgent(SpeechAgent):
         self.update_model_encoder(states)
 
     def policy(self, states):
-        if not getattr(states, "encoder_states", None):
-            if states.finish_read():
-                return WRITE_ACTION
-            else:
-                return READ_ACTION
+        #if not getattr(states, "encoder_states", None):
+        #    if states.finish_read():
+        #        return WRITE_ACTION
+        #    else:
+        #        return READ_ACTION
+            
+        if not states.finish_read():
+            return READ_ACTION
 
         tgt_indices = self.to_device(
             torch.LongTensor(
@@ -456,8 +486,12 @@ class FairseqSimulSTAgent(SpeechAgent):
         }
 
         states.incremental_states["online"] = {"only": torch.tensor(not states.finish_read())}
-        
+      
+        simul_chkpts_dc = {}
+
         if self.load_simul_attn_chkpts:
+            if not states.finish_read():
+                simul_chkpts_dc = copy.deepcopy(self.simul_attn_chkpts["layers"][0])
             x, outputs = self.model.decoder.forward(
                 prev_output_tokens=tgt_indices,
                 encoder_out=states.encoder_states,
@@ -465,6 +499,11 @@ class FairseqSimulSTAgent(SpeechAgent):
                 simul_attn_chkpts=self.simul_attn_chkpts,
             )
             self.simul_attn_chkpts["old_indices"] = states.incremental_states["steps"]
+            # allows for one computation with full input, then saves
+            #if states.finish_read():
+            #    self.simul_attn_chkpts["save_k_v_cross"] = True
+            #else:
+            #    self.simul_attn_chkpts["save_k_v_cross"] = False
         else:
             x, outputs = self.model.decoder.forward(
                 prev_output_tokens=tgt_indices,
@@ -479,17 +518,24 @@ class FairseqSimulSTAgent(SpeechAgent):
         torch.cuda.empty_cache()
 
         if (outputs.action == 0) and (not states.finish_read()):
+            print("trouble is here")
+            if self.load_simul_attn_chkpts:
+                self.simul_attn_chkpts["layers"][0] = simul_chkpts_dc
+                self.simul_attn_chkpts["save_k_v_cross"] = False
             return READ_ACTION
         else:
             if states.finish_read():
                 self.past_finish_read += 1
                 print(f"Past finish: {self.past_finish_read}", flush=True)
+                self.simul_attn_chkpts["save_k_v_cross"] = True
             return WRITE_ACTION
 
     def predict(self, states):
         if not getattr(states, "encoder_states", None):
             return self.model.decoder.dictionary.eos()
-        
+       
+        print(states)
+
         decoder_states = states.decoder_out
 
         lprobs = self.model.get_normalized_probs(

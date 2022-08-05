@@ -220,6 +220,11 @@ class ConvTransformerModel(FairseqEncoderDecoderModel):
             default=128,
             help="Sets the thresholding steps for the maximum src len in quadratic and fully linearized applications. Useful primarily for cosFormer.",
         )
+        parser.add_argument(
+            "--shortened-expt-simil",
+            action="store_true",
+            help="if True, adds an exponential similarity function for only causal attention.",
+        )
 
     @classmethod
     def build_encoder(cls, args):
@@ -287,7 +292,7 @@ class ConvTransformerModel(FairseqEncoderDecoderModel):
     def forward(self, src_tokens, src_lengths, prev_output_tokens):
         encoder_out = self.encoder(src_tokens=src_tokens, src_lengths=src_lengths)
         decoder_out = self.decoder(
-            prev_output_tokens=prev_output_tokens, encoder_out=encoder_out
+            prev_output_tokens=prev_output_tokens, encoder_out=encoder_out,
         )
         return decoder_out
 
@@ -503,7 +508,7 @@ class TransformerDecoderNoExtra(TransformerDecoder):
         alignment_heads: Optional[int] = None,
     ):
         # call scriptable method from parent class
-        x = self.extract_features_scriptable(
+        x, _ = self.extract_features_scriptable(
             prev_output_tokens,
             encoder_out,
             incremental_state,

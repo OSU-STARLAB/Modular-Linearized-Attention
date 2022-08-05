@@ -191,6 +191,28 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
         layer = fsdp_wrap(layer, min_num_params=min_params_to_wrap)
         return layer
 
+    def extract_features(
+        self,
+        prev_output_tokens,
+        encoder_out: Optional[Dict[str, List[Tensor]]],
+        incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
+        simul_attn_chkpts: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
+        full_context_alignment: bool = False,
+        alignment_layer: Optional[int] = None,
+        alignment_heads: Optional[int] = None,
+        tgt_len_mod = None,
+    ):
+        return self.extract_features_scriptable(
+            prev_output_tokens,
+            encoder_out,
+            incremental_state,
+            simul_attn_chkpts,
+            full_context_alignment,
+            alignment_layer,
+            alignment_heads,
+            tgt_len_mod,
+        )
+    
     def forward(
         self,
         prev_output_tokens,
@@ -203,6 +225,7 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
         alignment_heads: Optional[int] = None,
         src_lengths: Optional[Any] = None,
         return_all_hiddens: bool = False,
+        tgt_len_mod = None,
     ):
         """
         Args:
@@ -222,53 +245,34 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
                 - the decoder's output of shape `(batch, tgt_len, vocab)`
                 - a dictionary with any model-specific outputs
         """
-        
+       
         # VA, added quick fix for strange behavior, have to swap between these during ASR and SimulST training
-        inter_tuple, _ = self.extract_features(
-            prev_output_tokens,
-            encoder_out=encoder_out,
-            incremental_state=incremental_state,
-            full_context_alignment=full_context_alignment,
-            alignment_layer=alignment_layer,
-            alignment_heads=alignment_heads,
-        )
+        if incremental_state is None:
+            x, extra = self.extract_features(
+                prev_output_tokens,
+                encoder_out=encoder_out,
+                incremental_state=incremental_state,
+                full_context_alignment=full_context_alignment,
+                alignment_layer=alignment_layer,
+                alignment_heads=alignment_heads,
+            )
 
-        x = inter_tuple[0]
-        extra = inter_tuple[1]
-        
-#        x, extra = self.extract_features(
-#            prev_output_tokens,
-#            encoder_out=encoder_out,
-#            incremental_state=incremental_state,
-#            simul_attn_chkpts=simul_attn_chkpts,
-#            full_context_alignment=full_context_alignment,
-#            alignment_layer=alignment_layer,
-#            alignment_heads=alignment_heads,
-#        )
+        else: 
+            x, extra = self.extract_features(
+                prev_output_tokens,
+                encoder_out=encoder_out,
+                incremental_state=incremental_state,
+                simul_attn_chkpts=simul_attn_chkpts,
+                full_context_alignment=full_context_alignment,
+                alignment_layer=alignment_layer,
+                alignment_heads=alignment_heads,
+                tgt_len_mod=tgt_len_mod,
+            )
 
         if not features_only:
             x = self.output_layer(x)
         return x, extra
 
-    def extract_features(
-        self,
-        prev_output_tokens,
-        encoder_out: Optional[Dict[str, List[Tensor]]],
-        incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
-        simul_attn_chkpts: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
-        full_context_alignment: bool = False,
-        alignment_layer: Optional[int] = None,
-        alignment_heads: Optional[int] = None,
-    ):
-        return self.extract_features_scriptable(
-            prev_output_tokens,
-            encoder_out,
-            incremental_state,
-            simul_attn_chkpts,
-            full_context_alignment,
-            alignment_layer,
-            alignment_heads,
-        )
 
     """
     A scriptable subclass of this class has an extract_features method and calls
@@ -285,6 +289,7 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
         full_context_alignment: bool = False,
         alignment_layer: Optional[int] = None,
         alignment_heads: Optional[int] = None,
+        tgt_len_mod = None,
     ):
         """
         Similar to *forward* but only return features.

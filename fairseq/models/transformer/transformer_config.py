@@ -258,6 +258,10 @@ class TransformerConfig(FairseqDataclass):
         default=128,
         metadata={"help": "Sets the thresholding steps for the maximum src len in quadratic and fully linearized applications. Useful primarily for cosFormer."},
     )
+    shortened_expt_simil: bool = field(
+        default=False,
+        metadata={"help": "Adds a small similarity function for either ReLu or softmax based implementations."},
+    )
 
 
     # We need to make this hierarchical dataclass like the flat namespace

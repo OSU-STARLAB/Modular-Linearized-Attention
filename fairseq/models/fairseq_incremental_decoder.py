@@ -41,7 +41,7 @@ class FairseqIncrementalDecoder(FairseqDecoder):
         super().__init__(dictionary)
 
     def forward(
-        self, prev_output_tokens, encoder_out=None, incremental_state=None, **kwargs
+        self, prev_output_tokens, encoder_out=None, incremental_state=None, simul_attn_chkpts=None, **kwargs
     ):
         """
         Args:
@@ -60,7 +60,7 @@ class FairseqIncrementalDecoder(FairseqDecoder):
         raise NotImplementedError
 
     def extract_features(
-        self, prev_output_tokens, encoder_out=None, incremental_state=None, **kwargs
+        self, prev_output_tokens, encoder_out=None, incremental_state=None, simul_attn_chkpts=None, **kwargs
     ):
         """
         Returns:

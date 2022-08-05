@@ -57,6 +57,13 @@ class SimulConvTransformerModel(ConvTransformerModel):
             metavar="N",
             help="Specify size of input blocks for which block attention is allowed. Useful when inputs will be grouped following encoder (e.g., simultaneous translation using wait-k). Default=1 (no additional attention)",
         )
+        parser.add_argument(
+            "--simple-cross-attn",
+            action="store_true",
+            default=False,
+            help="Switch to enable simplified cross attention with ReLu activiation.",
+        )
+        
 #        parser.add_argument(
 #            "--cosformer-attn-enable",
 #            action="store_true",

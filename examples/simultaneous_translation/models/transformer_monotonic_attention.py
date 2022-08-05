@@ -205,6 +205,7 @@ class TransformerMonotonicDecoder(TransformerDecoder):
         full_context_alignment: bool = False,  # unused
         alignment_layer: Optional[int] = None,  # unused
         alignment_heads: Optional[int] = None,  # unsed
+        tgt_len_mod = None,
     ):
         """
         Similar to *forward* but only return features.
@@ -226,7 +227,7 @@ class TransformerMonotonicDecoder(TransformerDecoder):
         p_choose = torch.tensor([1.0])
 
         for i, layer in enumerate(self.layers):
-            x, attn = layer(
+            x, attn, _ = layer(
                 x=x,
                 layer_idx=i,
                 encoder_out=encoder_outs,
@@ -236,6 +237,7 @@ class TransformerMonotonicDecoder(TransformerDecoder):
                 self_attn_mask=self.buffered_future_mask(x)
                 if incremental_state is None
                 else None,
+                #tgt_len_mod=tgt_len_mod,
             )
             inner_states.append(x)
             attn_list.append(attn)

@@ -156,6 +156,95 @@ class CoVoST(Dataset):
         data = df.to_dict(orient="index").items()
         data = [v for k, v in sorted(data, key=lambda x: x[0])]
         self.data = []
+<<<<<<< HEAD
+=======
+
+        num_segments = len(data)
+        print(f"Processing {num_segments} segments.", flush=True)
+        for e in data:
+            for key, lang in zip(["sentence", "translation"], [source_language, target_language]):
+                e[key] = self.edit_utterance(e[key], lang, pair_type)
+
+        clips_path = self.root / "clips"
+        if (pair_type is not None) and (pair_type != "none"):
+            print(f"Creating paired dataset with method: {pair_type}", flush=True)
+            print(f"Creating pool with cpus: {multiprocessing.cpu_count()-1}", flush=True)
+            pair_pool = multiprocessing.Pool(multiprocessing.cpu_count()-1)
+            print(f"Pool created successfully", flush=True)
+            pair_segments = []
+            for i, cur_segment in enumerate(data):
+                if i+1 < num_segments:
+                    next_segment = data[i+1]
+                else:
+                    next_segment = None
+                pair_segment = {k: v for k,v in cur_segment.items()}    # Deepcopy in case we want to keep original segments unchanged
+                pair_segment["client_id"] += "_pair"
+
+                if (pair_type == "partial") or (pair_type == "original+partial") :
+                    # 'Partial' method uses 1.5 seconds of audio from another segment, but none of the text
+                    # This method aims to make model aware of potential for subsequent sentences
+                    # Placing the end of context token <e> therefore requires learning to ignore audio after the current sentence
+
+                    # Only use cur_segment with one sentence, but don't care about next_segment length since we're only using a small amount of audio anyways
+                    if (next_segment is not None) and (cur_segment["client_id"] == next_segment["client_id"]) and (self.get_sentence_count(cur_segment["translation"]) == 1) and (self.get_sentence_count(next_segment["translation"]) >= 1):
+                        pair_segment["sentence"] = cur_segment["sentence"]
+                        pair_segment["translation"] = cur_segment["translation"]
+                        
+                        idx = pair_segment["path"].find(".wav")
+                        pair_segment["path"] = pair_segment["path"][:idx] + "_pair.wav"
+                        
+                        pair_segments.append(pair_segment)
+
+                        # Have to make new combined audio file since dataset has 1 sentence per file
+                        dst_path = (clips_path / pair_segment["path"])
+                        src_path_one = (clips_path / cur_segment["path"])
+                        src_path_two = (clips_path / next_segment["path"])
+                        duration_two = 1.5
+                        if dst_path.is_file():
+                            pass    # File already exists, no need to re-compute
+                        else:
+                            #self.combine_audio_segments(dst_path, src_path_one, src_path_two, duration_two) 
+                            pair_pool.apply_async(self.combine_audio_segments, args=(dst_path.as_posix(), src_path_one.as_posix(), src_path_two.as_posix(), duration_two))
+
+                elif (pair_type == "full") or (pair_type == "original+full"):
+                    # 'Full' method uses all audio & text from the next sentence/segment
+                    # This method aims to make model aware of potential contextual information, or just consistency across sentences
+                    # But makes assumption that there will "always" be a 2nd sentence, so could introduce odd behavior if evaluating on single-sentence dataset
+
+                    if (next_segment is not None) and (cur_segment["client_id"] == next_segment["client_id"]) and (self.get_sentence_count(cur_segment["translation"]) == 1) and (self.get_sentence_count(next_segment["translation"]) == 1):
+                        pair_segment["sentence"] = cur_segment["sentence"] + " " + next_segment["sentence"]
+                        pair_segment["translation"] = cur_segment["translation"] + " " + next_segment["translation"]
+                        
+                        idx = pair_segment["path"].find(".wav")
+                        pair_segment["path"] = pair_segment["path"][:idx] + "_pair.wav"
+                        
+                        pair_segments.append(pair_segment)
+                         
+                        # Have to make new combined audio file since dataset has 1 sentence per file
+                        dst_path = (clips_path / pair_segment["path"])
+                        src_path_one = (clips_path / cur_segment["path"])
+                        src_path_two = (clips_path / next_segment["path"])
+                        duration_two = 100
+                        if dst_path.is_file():
+                            pass    # File already exists, no need to re-compute
+                        else:
+                            #self.combine_audio_segments(dst_path, src_path_one, src_path_two, duration_two)
+                            pair_pool.apply_async(self.combine_audio_segments, args=(dst_path.as_posix(), src_path_one.as_posix(), src_path_two.as_posix(), duration_two))
+
+                    elif self.get_sentence_count(cur_segment["translation"]) == 2:
+                        pair_segments.append(pair_segment)
+
+            print(f"Closing pool and joining...", flush=True)
+            pair_pool.close()
+            pair_pool.join()
+            print(f"Pool closed & all processes joined", flush=True)
+
+            if "original" in pair_type:
+                data = data + pair_segments
+            else:
+                data = pair_segments
+
+>>>>>>> 833e5c7... Change covost to use 16000 KHz audio sampling rate. Requires dataset to be re-sampled prior to running prep_covost_data (see /fairseq/helper_scripts/covost/resample_covost.sh)
         for e in data:
             try:
                 path = self.root / "clips" / e["path"]
@@ -182,7 +271,7 @@ class CoVoST(Dataset):
         sentence = data["sentence"]
         translation = None if self.no_translation else data["translation"]
         speaker_id = data["client_id"]
-        _id = data["path"].replace(".mp3", "")
+        _id = data["path"].replace(".wav", "")
         return waveform, sample_rate, sentence, translation, speaker_id, _id
 
     def __len__(self) -> int:

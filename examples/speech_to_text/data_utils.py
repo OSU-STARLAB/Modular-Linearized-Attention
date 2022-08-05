@@ -163,6 +163,7 @@ def gen_config_yaml(
         "ld": writer.set_specaugment_ld_policy,
         "sm": writer.set_specaugment_sm_policy,
         "ss": writer.set_specaugment_ss_policy,
+        "st": writer.set_specaugment_st_policy,
     }
     specaugment_setter = specaugment_setters.get(specaugment_policy, None)
     if specaugment_setter is not None:
@@ -265,7 +266,7 @@ def filter_manifest_df(
 
 
 def cal_gcmvn_stats(features_list):
-    features = np.concatenate(features_list)
+    features = np.concatenate(features_list).astype("float64")
     square_sums = (features ** 2).sum(axis=0)
     mean = features.mean(axis=0)
     features = np.subtract(features, mean)
@@ -355,6 +356,16 @@ class S2TDataConfigWriter(object):
             time_mask_t=70,
             time_mask_p=0.2,
         )
+
+   def set_specaugment_st_policy(self):
+        self.set_specaugment(
+            time_wrap_w=0,
+            freq_mask_n=2,
+            freq_mask_f=10,
+            time_mask_n=10,
+            time_mask_t=16,
+            time_mask_p=1.0,
+        ) 
 
     def set_input_channels(self, input_channels: int = 1):
         self.config["input_channels"] = input_channels

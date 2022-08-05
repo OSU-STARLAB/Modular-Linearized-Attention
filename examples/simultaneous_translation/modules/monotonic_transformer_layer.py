@@ -153,9 +153,11 @@ class TransformerMonotonicDecoderLayer(TransformerDecoderLayer):
             value=encoder_out,
             key_padding_mask=encoder_padding_mask,
             incremental_state=incremental_state,
+            simul_attn_chkpts=simul_attn_chkpts,
             static_kv=True,
             need_weights=need_attn or (not self.training and self.need_attn),
             need_head_weights=need_head_weights,
+            layer_idx=layer_idx,
         )
         #print(f"Attn output shape: {x.shape}")
         x = self.dropout_module(x)
@@ -186,4 +188,4 @@ class TransformerMonotonicDecoderLayer(TransformerDecoderLayer):
             else:
                 self_attn_state = [saved_state["prev_key"], saved_state["prev_value"]]
             return x, attn, self_attn_state
-        return x, attn
+        return x, attn, None

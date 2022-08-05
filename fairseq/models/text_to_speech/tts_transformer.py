@@ -201,6 +201,7 @@ class TTSTransformerDecoder(FairseqIncrementalDecoder):
             self_attn_padding_mask, incremental_state=incremental_state
         )
 
+        #print(incremental_state)
         if incremental_state is not None:
             prev_outputs = prev_outputs[:, -1:, :]
             self_attn_padding_mask = self_attn_padding_mask[:, -1:]
@@ -393,6 +394,8 @@ class TTSTransformerModel(FairseqEncoderDecoderModel):
         parser.add_argument("--decoder-ffn-embed-dim", type=int)
         parser.add_argument("--decoder-normalize-before", action="store_true")
         parser.add_argument("--decoder-attention-heads", type=int)
+        parser.add_argument("--simple-attention", action="store_true")
+        parser.add_argument("--shortened-expt-simil", action="store_true")
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
