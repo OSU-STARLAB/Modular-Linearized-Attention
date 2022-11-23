@@ -22,9 +22,9 @@ def setup_registry(registry_name: str, base_class=None, default=None, required=F
     REGISTRY_CLASS_NAMES = set()
     DATACLASS_REGISTRY = {}
 
-    # maintain a registry of all registries
-    if registry_name in REGISTRIES:
-        return  # registry already exists
+    # maintain a registry of all registries, VA: broken
+    #if registry_name in REGISTRIES:
+    #    return  # registry already exists
     REGISTRIES[registry_name] = {
         "registry": REGISTRY,
         "default": default,

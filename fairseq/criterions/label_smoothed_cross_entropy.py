@@ -33,6 +33,8 @@ class LabelSmoothedCrossEntropyCriterionConfig(FairseqDataclass):
 def label_smoothed_nll_loss(lprobs, target, epsilon, ignore_index=None, reduce=True):
     if target.dim() == lprobs.dim() - 1:
         target = target.unsqueeze(-1)
+    if target.size(dim=0) > lprobs.size(dim=0):
+        target = target[:lprobs.size(dim=0),:]
     nll_loss = -lprobs.gather(dim=-1, index=target)
     smooth_loss = -lprobs.sum(dim=-1, keepdim=True)
     if ignore_index is not None:
