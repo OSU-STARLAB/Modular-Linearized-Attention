@@ -201,6 +201,7 @@ class TransformerMonotonicDecoder(TransformerDecoder):
         prev_output_tokens,
         encoder_out: Optional[Dict[str, List[Tensor]]],
         incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
+        simul_attn_chkpts: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
         full_context_alignment: bool = False,  # unused
         alignment_layer: Optional[int] = None,  # unused
         alignment_heads: Optional[int] = None,  # unsed
@@ -225,17 +226,17 @@ class TransformerMonotonicDecoder(TransformerDecoder):
         p_choose = torch.tensor([1.0])
 
         for i, layer in enumerate(self.layers):
-
-            x, attn, _ = layer(
+            x, attn = layer(
                 x=x,
+                layer_idx=i,
                 encoder_out=encoder_outs,
                 encoder_padding_mask=encoder_padding_mask,
                 incremental_state=incremental_state,
+                simul_attn_chkpts=simul_attn_chkpts,
                 self_attn_mask=self.buffered_future_mask(x)
                 if incremental_state is None
                 else None,
             )
-
             inner_states.append(x)
             attn_list.append(attn)
 
@@ -254,7 +255,6 @@ class TransformerMonotonicDecoder(TransformerDecoder):
                             # if model decide not to read
                             # otherwise there will be duplicated saved_state
                             self.clean_cache(incremental_state, i + 1)
-
                             return x, TransformerMonotonicDecoderOut(
                                 action=0,
                                 p_choose=p_choose,
@@ -262,7 +262,6 @@ class TransformerMonotonicDecoder(TransformerDecoder):
                                 encoder_out=None,
                                 encoder_padding_mask=None,
                             )
-
         x = self.post_attention(x)
 
         return x, TransformerMonotonicDecoderOut(
