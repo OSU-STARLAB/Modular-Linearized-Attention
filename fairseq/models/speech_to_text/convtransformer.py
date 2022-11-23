@@ -187,6 +187,39 @@ class ConvTransformerModel(FairseqEncoderDecoderModel):
             action="store_true",
             help="if True, use simple attention without softmax as proposed by https://arxiv.org/pdf/2111.15588.pdf",
         )
+        # VA, cosFormer support
+        parser.add_argument(
+            "--cosformer-attn-enable",
+            action="store_true",
+            help="if True, replace softmax with ReLU and cosine-based transform as proposed by the paper introducing cosFormer",
+        )
+        parser.add_argument(
+            "--cosformer-expt-attn-enable",
+            action="store_true",
+            help="if True, replace softmax with ReLU and cosine-based transform as proposed by the paper introducing cosFormer. Added an expt component.",
+        )
+        parser.add_argument(
+            "--combin-attn-enable",
+            action="store_true",
+            help="if True, replace softmax with ReLU and combin-based transform",
+        )
+        parser.add_argument(
+            "--combin-expt-attn-enable",
+            action="store_true",
+            help="if True, replace softmax with ReLU and combin-based transform",
+        )
+        parser.add_argument(
+            "--disable-norm-stretch-factor",
+            action="store_false",
+            help="if True, removes full-sentence stretching for normalization on online applications.",
+        )
+        parser.add_argument(
+            "--max-src-len-step-size",
+            type=int,
+            metavar="INT",
+            default=128,
+            help="Sets the thresholding steps for the maximum src len in quadratic and fully linearized applications. Useful primarily for cosFormer.",
+        )
 
     @classmethod
     def build_encoder(cls, args):
@@ -400,7 +433,8 @@ class ConvTransformerEncoder(FairseqEncoder):
         x = F.dropout(x, p=self.dropout, training=self.training)
 
         for layer in self.transformer_layers:
-            x = layer(x=x, encoder_padding_mask=encoder_padding_mask, attn_mask=self.buffered_future_mask(x))
+            #x = layer(x=x, encoder_padding_mask=encoder_padding_mask, attn_mask=self.buffered_future_mask(x))
+            x = layer(x=x, encoder_padding_mask=encoder_padding_mask)
 
         if not encoder_padding_mask.any():
             maybe_encoder_padding_mask = None
@@ -469,7 +503,7 @@ class TransformerDecoderNoExtra(TransformerDecoder):
         alignment_heads: Optional[int] = None,
     ):
         # call scriptable method from parent class
-        x, _ = self.extract_features_scriptable(
+        x = self.extract_features_scriptable(
             prev_output_tokens,
             encoder_out,
             incremental_state,

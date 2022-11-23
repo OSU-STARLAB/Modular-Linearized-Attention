@@ -59,6 +59,10 @@ class MonotonicAttention(MultiheadAttention):
             else 0
         )
 
+        #if args.cosformer_attn_enable is not None:
+        #self.cosformer_attn_enable = args.cosformer_attn_enable
+        self.cosformer_attn_enable = False
+
         self.k_in_proj = {"monotonic": self.k_proj}
         self.q_in_proj = {"monotonic": self.q_proj}
         self.chunk_size = None
@@ -252,6 +256,8 @@ class MonotonicAttention(MultiheadAttention):
         if self.soft_attention:
             # monotonic_step = monotonic_step.t()
             beta_mask = torch.arange(src_len, device=alpha.device).expand_as(alpha).gt(monotonic_step).unsqueeze(1)
+            #print(beta_mask)
+            #print(beta_mask.shape)
             # If it's soft attention just do softmax on current context
             soft_energy = self.energy_from_qk(
                 query,
@@ -333,6 +339,7 @@ class MonotonicAttention(MultiheadAttention):
         key_padding_mask: Optional[Tensor] = None,
         attn_mask: Optional[Tensor] = None,
         incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
+        simul_attn_chkpts: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
         need_weights: bool = True, static_kv: bool = False, need_head_weights: bool = False,
     ):
         """
@@ -360,7 +367,11 @@ class MonotonicAttention(MultiheadAttention):
                 .contiguous()
                 .view(-1, src_len)
             )
-
+        
+        if self.cosformer_attn_enable:
+            pass
+            #return cosformer_attn_train_and_infer(query, key, value, incremental_state, simul_attn_chkpts)
+        
         if incremental_state is not None:
             # Inference
             (
@@ -390,6 +401,8 @@ class MonotonicAttention(MultiheadAttention):
         attn = attn.transpose(0, 1).contiguous().view(tgt_len, bsz, embed_dim)
 
         attn = self.out_proj(attn)
+        
+        #print(f"Some shapes of interest. k: {key.shape}, q: {query.shape}, v: {value.shape}, beta: {beta.shape}, attn: {attn.shape}")
 
         p_choose = p_choose.view(bsz, self.num_heads, tgt_len, src_len)
         alpha = alpha.view(bsz, self.num_heads, tgt_len, src_len)
@@ -419,6 +432,257 @@ class MonotonicAttention(MultiheadAttention):
             buffer,
         )
 
+    def cosformer_attn_train_and_infer(
+        self,
+        query: Optional[Tensor],
+        key: Optional[Tensor],
+        value: Optional[Tensor],
+        layer_idx = None,
+        key_padding_mask: Optional[Tensor] = None,
+        attn_mask: Optional[Tensor] = None,
+        incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
+        simul_attn_chkpts: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
+        need_weights: bool = True, static_kv: bool = False, need_head_weights: bool = False,
+    ):
+       
+        if simul_attn_chkpts:
+            """
+            Monotonic attention at inference time
+            Notice that this function is designed for simuleval not sequence_generator
+            """
+            assert query is not None
+            assert key is not None
+            assert value is not None
+
+            if query.size(1) != 1:
+                raise RuntimeError(
+                    "Simultaneous translation models don't support batch decoding."
+                )
+            # 1. compute stepwise probability
+            p_choose = self.p_choose(
+                query, key, None, incremental_state
+            ).squeeze(1)
+
+            # 2. Compute the alpha
+            src_len = key.size(0)
+            # Maximum steps allows in this iteration
+            max_steps = src_len - 1 if self.mass_preservation else src_len
+            monotonic_cache = self._get_monotonic_buffer(incremental_state)
+            # Step for each head
+            monotonic_step = monotonic_cache.get(
+                'head_step',
+                p_choose.new_zeros(self.num_heads, 1).long()
+            )
+            assert monotonic_step is not None
+            finish_read = monotonic_step.eq(max_steps)
+            p_choose_i = torch.tensor(1)
+
+            while finish_read.sum().item() < self.num_heads:
+                # p_choose: self.num_heads, src_len
+                # only choose the p at monotonic steps
+                # p_choose_i: self.num_heads, 1
+                p_choose_i = (
+                    p_choose.gather(
+                        1,
+                        monotonic_step
+                        .clamp(0, src_len - 1),
+                    )
+                )
+
+                read_one_step = (
+                    (p_choose_i < 0.5)
+                    .type_as(monotonic_step)
+                    .masked_fill(finish_read, 0)
+                )
+                # self.num_heads x 1
+                # sample actions on unfinished seq
+                # 0 means stay, finish reading
+                # 1 means leave, continue reading
+
+                monotonic_step += read_one_step
+
+                finish_read = monotonic_step.eq(max_steps) | (read_one_step == 0)
+
+            # p_choose at last steps
+            p_choose_i = (
+                p_choose.gather(
+                    1,
+                    monotonic_step
+                    .clamp(0, src_len - 1),
+                )
+            )
+
+            monotonic_cache["head_step"] = monotonic_step
+            # Whether a head is looking for new input
+            monotonic_cache["head_read"] = (
+                monotonic_step.eq(max_steps) & (p_choose_i < 0.5)
+            )
+            self._set_monotonic_buffer(incremental_state, monotonic_cache)
+            # end monotonic inference behavior, onto more typical functionality
+
+
+        # prepping input tensors
+        length, bsz, _ = query.size()
+        q = self.q_in_proj[energy_type].forward(query)
+        q = (
+            q.contiguous()
+            .view(length, bsz * self.num_heads, self.head_dim)
+            .transpose(0, 1)
+        )
+        #q = q * self.scaling
+        
+        length, bsz, _ = key.size()
+        k = self.k_in_proj[energy_type].forward(key)
+        k = (
+            k.contiguous()
+            .view(length, bsz * self.num_heads, self.head_dim)
+            .transpose(0, 1)
+        )
+        
+        v = self.v_proj(value)
+        length, bsz, _ = v.size()
+        v = (
+            v.contiguous()
+            .view(length, bsz * self.num_heads, self.head_dim)
+            .transpose(0, 1)
+        )
+
+        q = F.relu(q)
+        k = F.relu(k)
+
+        # second attempt at cosformer, should hopefully correct problems, implementation of normalizing vector now in line with expectations
+        q_sin_init = q
+        q_cos_init = q
+        k_sin_init = k
+        k_cos_init = k
+        src_len = list(k.shape)[1]
+        tgt_len = list(q.shape)[1]
+        q_sin = torch.zeros(q.shape, device=q.device)
+        q_cos = torch.zeros(q.shape, device=q.device)
+        k_sin = torch.zeros(k.shape, device=k.device)
+        k_cos = torch.zeros(k.shape, device=k.device)
+        idx = torch.zeros(src_len, device = k.device)
+        norm_sin = torch.zeros(list(k.shape)[0], list(k.shape)[2], 1, device=k.device)
+        norm_cos = torch.zeros(list(k.shape)[0], list(k.shape)[2], 1, device=k.device)
+
+        #print(simul_attn_chkpts is not None)
+
+        if simul_attn_chkpts is not None:
+            assert layer_idx is not None
+            norm_sin = simul_attn_chkpts["layers"][layer_idx]["enc_dec_attn"]["norm_sin"]
+            norm_cos = simul_attn_chkpts["layers"][layer_idx]["enc_dec_attn"]["norm_cos"]
+        
+        # should strongly consider changing 2*src_len to 768 or some other constant
+        if simul_attn_chkpts is not None:
+            src_idx = incremental_state["steps"]["src"]
+            tgt_idx = incremental_state["steps"]["tgt"]
+            old_src_idx = simul_attn_chkpts["old_indices"]["src"]
+            old_tgt_idx = simul_attn_chkpts["old_indices"]["tgt"]
+            q_sin = torch.mul(q_sin_init, math.sin((3.1415*(tgt_idx - 1) + 0.1)/(2*768)))
+            q_cos = torch.mul(q_cos_init, math.cos((3.1415*(tgt_idx - 1) + 0.1)/(2*768)))
+            sin_tr = simul_attn_chkpts["sin_tr"]
+            cos_tr = simul_attn_chkpts["cos_tr"]
+
+            if simul_attn_chkpts["kTv_update"]:
+                sin_tr = sin_tr[old_src_idx:src_idx].unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+                cos_tr = cos_tr[old_src_idx:src_idx].unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+                if simul_attn_chkpts["layers"][layer_idx]["enc_dec_attn"]["k_sin"] is not None and simul_attn_chkpts["layers"][layer_idx]["enc_dec_attn"]["k_sin"] is not None:
+                    k_sin = torch.cat((simul_attn_chkpts["layers"][layer_idx]["enc_dec_attn"]["k_sin"], torch.matmul(k_sin_init[:, old_src_idx:, :].unsqueeze(-1), sin_tr).squeeze(-1)), dim=1)
+                    k_cos = torch.cat((simul_attn_chkpts["layers"][layer_idx]["enc_dec_attn"]["k_cos"], torch.matmul(k_cos_init[:, old_src_idx:, :].unsqueeze(-1), cos_tr).squeeze(-1)), dim=1)
+                else:
+                    k_sin = torch.matmul(k_sin_init[:, old_src_idx:, :].unsqueeze(-1), sin_tr).squeeze(-1)
+                    k_cos = torch.matmul(k_cos_init[:, old_src_idx:, :].unsqueeze(-1), cos_tr).squeeze(-1)
+
+                if norm_sin is not None and norm_cos is not None:
+                    norm_sin = norm_sin + torch.sum(k_sin.unsqueeze(-1)[:, old_src_idx:, :])
+                    norm_cos = norm_cos + torch.sum(k_cos.unsqueeze(-1)[:, old_src_idx:, :])
+                else:
+                    norm_sin = torch.sum(k_sin.unsqueeze(-1)[:, old_src_idx:, :], dim=1)
+                    norm_cos = torch.sum(k_cos.unsqueeze(-1)[:, old_src_idx:, :], dim=1)
+            else:
+                k_sin = simul_attn_chkpts["layers"][layer_idx]["enc_dec_attn"]["k_sin"]
+                k_cos = simul_attn_chkpts["layers"][layer_idx]["enc_dec_attn"]["k_cos"]
+
+        else:
+            for i in range(max(src_len, tgt_len)):
+                idx[i] = i
+
+            sin_tr = torch.sin((3.1415*idx+0.1)/(2*768))
+            cos_tr = torch.cos((3.1415*idx+0.1)/(2*768))
+            sin_tr = sin_tr.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+            cos_tr = cos_tr.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+            q_sin = torch.matmul(q_sin_init.unsqueeze(-1), sin_tr[:, :tgt_len, :, :])
+            q_sin = torch.clamp_min(q_sin.squeeze(-1), 0.01)
+            q_cos = torch.matmul(q_cos_init.unsqueeze(-1), cos_tr[:, :tgt_len, :, :])
+            q_cos = torch.clamp_min(q_cos.squeeze(-1), 0.01)
+            k_sin = torch.matmul(k_sin_init.unsqueeze(-1), sin_tr[:, :src_len, :, :]).squeeze(-1)
+            k_cos = torch.matmul(k_cos_init.unsqueeze(-1), cos_tr[:, :src_len, :, :]).squeeze(-1)
+            norm_sin = torch.sum(k_sin, dim=1).unsqueeze(-1)
+            norm_cos = torch.sum(k_cos, dim=1).unsqueeze(-1)
+
+
+        if simul_attn_chkpts is not None:
+            if simul_attn_chkpts["kTv_update"]:
+                #print(f"Self_attn values: q: {q.shape}, kT: {k_sin[old_src_idx:, :, :].transpose(1, 2).shape}, v: {v[old_src_idx:, :, :].shape}")
+                #print(f"Self_attn values: q: {q.shape}, k: {k.shape}, kT: {k_sin.transpose(1, 2).shape}, v: {v.shape}")
+                #print(f'Some other values of interest: src_idx old {simul_attn_chkpts["old_indices"]["src"]}, src_idx_curr {incremental_state["steps"]["src"]}, listed src length {src_len}')
+                #print(f'Some other values of interest: tgt_idx old {simul_attn_chkpts["old_indices"]["tgt"]}, tgt_idx_curr {incremental_state["steps"]["tgt"]}')
+                attn_weights_v_sin = torch.bmm(k_sin[:, old_src_idx:, :].transpose(1, 2), v[:, old_src_idx:, :])
+                attn_weights_v_cos = torch.bmm(k_cos[:, old_src_idx:, :].transpose(1, 2), v[:, old_src_idx:, :])
+                old_attn_weights_v_sin = simul_attn_chkpts["layers"][layer_idx]["enc_dec_attn"]["kTv_sin"]
+                old_attn_weights_v_cos = simul_attn_chkpts["layers"][layer_idx]["enc_dec_attn"]["kTv_cos"]
+
+                if old_attn_weights_v_sin is not None and old_attn_weights_v_cos is not None:
+                    attn_weights_v_sin = old_attn_weights_v_sin + attn_weights_v_sin
+                    attn_weights_v_cos = old_attn_weights_v_cos + attn_weights_v_cos
+            
+            else:
+                attn_weights_v_sin = simul_attn_chkpts["layers"][layer_idx]["enc_dec_attn"]["kTv_sin"]
+                attn_weights_v_cos = simul_attn_chkpts["layers"][layer_idx]["enc_dec_attn"]["kTv_cos"]
+        
+        else:
+            attn_weights_v_sin = torch.bmm(k_sin.transpose(1, 2), v)
+            attn_weights_v_cos = torch.bmm(k_cos.transpose(1, 2), v)
+        
+        attn_weights_sin = torch.bmm(q_sin, attn_weights_v_sin)
+        attn_weights_cos = torch.bmm(q_cos, attn_weights_v_cos)
+        attn_weights = attn_weights_sin + attn_weights_cos
+
+        # expanding normalizing vector to 768, accounting for size
+        norm_stretch_factor = 768/list(k.shape)[1]
+
+        prob_norm_sin = torch.bmm(q_sin, norm_stretch_factor * norm_sin)
+        prob_norm_cos = torch.bmm(q_cos, norm_stretch_factor * norm_cos)
+        prob_norm = prob_norm_sin + prob_norm_cos
+
+        prob_norm.expand(list(prob_norm.shape)[0], list(prob_norm.shape)[1], list(attn_weights.shape)[2])
+        prob_norm = torch.clamp_min(prob_norm, 0.1)
+
+        #print(f"Some more information of interest. prob_norm: {prob_norm.shape}, attn_weights: {attn_weights.shape}")
+        #attn_probs = torch.bmm(attn_weights, torch.inverse(prob_norm))
+        attn_probs = attn_weights / prob_norm
+
+        attn = attn_probs
+
+        #print(simul_attn_chkpts)
+        #print(attn.shape)
+        #print(tgt_len)
+        #print(bsz)
+        #print(self.embed_dim)
+        attn = attn.transpose(0, 1).contiguous().view(tgt_len, bsz, self.embed_dim)
+        attn = self.out_proj(attn)
+
+        if simul_attn_chkpts is not None:
+            simul_attn_chkpts["layers"][layer_idx]["enc_dec_attn"]["norm_sin"] = norm_sin
+            simul_attn_chkpts["layers"][layer_idx]["enc_dec_attn"]["norm_cos"] = norm_cos
+            simul_attn_chkpts["layers"][layer_idx]["enc_dec_attn"]["k_sin"] = k_sin
+            simul_attn_chkpts["layers"][layer_idx]["enc_dec_attn"]["k_cos"] = k_cos
+            simul_attn_chkpts["layers"][layer_idx]["enc_dec_attn"]["kTv_sin"] = attn_weights_v_sin
+            simul_attn_chkpts["layers"][layer_idx]["enc_dec_attn"]["kTv_cos"] = attn_weights_v_cos
+
+            return attn, attn_weights
+
+        return attn, attn_weights
 
 @register_monotonic_attention("infinite_lookback")
 class MonotonicInfiniteLookbackAttention(

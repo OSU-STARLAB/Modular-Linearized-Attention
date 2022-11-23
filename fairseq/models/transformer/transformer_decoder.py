@@ -196,6 +196,7 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
         prev_output_tokens,
         encoder_out: Optional[Dict[str, List[Tensor]]] = None,
         incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
+        simul_attn_chkpts: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
         features_only: bool = False,
         full_context_alignment: bool = False,
         alignment_layer: Optional[int] = None,
@@ -221,8 +222,9 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
                 - the decoder's output of shape `(batch, tgt_len, vocab)`
                 - a dictionary with any model-specific outputs
         """
-
-        x, extra = self.extract_features(
+        
+        # VA, added quick fix for strange behavior, have to swap between these during ASR and SimulST training
+        inter_tuple, _ = self.extract_features(
             prev_output_tokens,
             encoder_out=encoder_out,
             incremental_state=incremental_state,
@@ -230,6 +232,19 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
             alignment_layer=alignment_layer,
             alignment_heads=alignment_heads,
         )
+
+        x = inter_tuple[0]
+        extra = inter_tuple[1]
+        
+#        x, extra = self.extract_features(
+#            prev_output_tokens,
+#            encoder_out=encoder_out,
+#            incremental_state=incremental_state,
+#            simul_attn_chkpts=simul_attn_chkpts,
+#            full_context_alignment=full_context_alignment,
+#            alignment_layer=alignment_layer,
+#            alignment_heads=alignment_heads,
+#        )
 
         if not features_only:
             x = self.output_layer(x)
@@ -240,6 +255,7 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
         prev_output_tokens,
         encoder_out: Optional[Dict[str, List[Tensor]]],
         incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
+        simul_attn_chkpts: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
         full_context_alignment: bool = False,
         alignment_layer: Optional[int] = None,
         alignment_heads: Optional[int] = None,
@@ -248,6 +264,7 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
             prev_output_tokens,
             encoder_out,
             incremental_state,
+            simul_attn_chkpts,
             full_context_alignment,
             alignment_layer,
             alignment_heads,
@@ -264,6 +281,7 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
         prev_output_tokens,
         encoder_out: Optional[Dict[str, List[Tensor]]],
         incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
+        simul_attn_chkpts: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
         full_context_alignment: bool = False,
         alignment_layer: Optional[int] = None,
         alignment_heads: Optional[int] = None,
@@ -375,7 +393,7 @@ class TransformerDecoderBase(FairseqIncrementalDecoder):
 
         if self.project_out_dim is not None:
             x = self.project_out_dim(x)
-
+        
         return x, {"attn": [attn], "inner_states": inner_states}
 
     def output_layer(self, features):

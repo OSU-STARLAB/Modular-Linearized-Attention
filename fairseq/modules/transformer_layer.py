@@ -66,6 +66,9 @@ class TransformerEncoderLayerBase(nn.Module):
             self.quant_noise_block_size,
         )
 
+        # VA, simultaneous checkpointing functionality
+        self.linear_simul_attn_chkpts = False
+
         self.final_layer_norm = LayerNorm(self.embed_dim, export=cfg.export)
 
     def build_fc1(self, input_dim, output_dim, q_noise, qn_block_size):
@@ -142,6 +145,12 @@ class TransformerEncoderLayerBase(nn.Module):
             q_noise=self.quant_noise,
             qn_block_size=self.quant_noise_block_size,
             simple_attention=cfg.simple_attention,
+            cosformer_attn_enable=cfg.cosformer_attn_enable,
+            cosformer_expt_attn_enable=cfg.cosformer_expt_attn_enable,
+            combin_attn_enable=cfg.combin_attn_enable,
+            combin_expt_attn_enable=cfg.combin_expt_attn_enable,
+            enable_norm_stretch_factor=(not cfg.disable_norm_stretch_factor),
+            max_src_len_step_size=cfg.max_src_len_step_size,
         )
 
     def residual_connection(self, x, residual):
@@ -203,6 +212,7 @@ class TransformerEncoderLayerBase(nn.Module):
             need_weights=False,
             attn_mask=attn_mask,
         )
+        #print(f"Encoder self-attn shape: {x.shape}")
         x = self.dropout_module(x)
         x = self.residual_connection(x, residual)
         if not self.normalize_before:
@@ -342,6 +352,9 @@ class TransformerDecoderLayerBase(nn.Module):
 
         self.onnx_trace = False
 
+        # VA, simultaneous checkpointing functionality
+        self.linear_simul_attn_chkpts = False
+    
     def build_fc1(self, input_dim, output_dim, q_noise, qn_block_size):
         return quant_noise(nn.Linear(input_dim, output_dim), q_noise, qn_block_size)
 
@@ -361,6 +374,12 @@ class TransformerDecoderLayerBase(nn.Module):
             q_noise=self.quant_noise,
             qn_block_size=self.quant_noise_block_size,
             simple_attention=cfg.simple_attention,
+            cosformer_attn_enable=cfg.cosformer_attn_enable,
+            cosformer_expt_attn_enable=cfg.cosformer_expt_attn_enable,
+            combin_attn_enable=cfg.combin_attn_enable,
+            combin_expt_attn_enable=cfg.combin_expt_attn_enable,
+            enable_norm_stretch_factor=(not cfg.disable_norm_stretch_factor),
+            max_src_len_step_size=cfg.max_src_len_step_size,
         )
 
     def build_encoder_attention(self, embed_dim, cfg):
@@ -374,6 +393,7 @@ class TransformerDecoderLayerBase(nn.Module):
             q_noise=self.quant_noise,
             qn_block_size=self.quant_noise_block_size,
             simple_attention=cfg.simple_attention,
+            #cosformer_attn_enable=cfg.cosformer_attn_enable,
         )
 
     def prepare_for_onnx_export_(self):
@@ -448,7 +468,6 @@ class TransformerDecoderLayerBase(nn.Module):
             y = torch.cat((encoder_out, x), dim=0)
         else:
             y = x
-
         x, attn = self.self_attn(
             query=x,
             key=y,
@@ -458,6 +477,7 @@ class TransformerDecoderLayerBase(nn.Module):
             need_weights=False,
             attn_mask=self_attn_mask,
         )
+        #print(f"Decoder self-attn shape: {x.shape}")
         if self.c_attn is not None:
             tgt_len, bsz = x.size(0), x.size(1)
             x = x.view(tgt_len, bsz, self.nh, self.head_dim)
@@ -496,6 +516,8 @@ class TransformerDecoderLayerBase(nn.Module):
                 need_head_weights=need_head_weights,
             )
             x = self.dropout_module(x)
+            #print(f"Attn output shape: {x.shape}")
+            #print(f"Residual shape: {residual.shape}")
             x = self.residual_connection(x, residual)
             if not self.normalize_before:
                 x = self.encoder_attn_layer_norm(x)

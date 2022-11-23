@@ -152,8 +152,52 @@ class FairseqSimulSTAgent(SpeechAgent):
         self.feature_extractor = OnlineFeatureExtractor(args)
 
         self.max_len = args.max_len
+        self.max_len_after_finish_read = args.max_len_after_finish_read
+        print(f"Max len overall: {self.max_len}, max len after finish reading: {self.max_len_after_finish_read}", flush=True)
+
+        # VA, necessary for linearized attention and quadratic attention
+        self.cosformer_attn_enable = args.cosformer_attn_enable
+        self.cosformer_expt_attn_enable = args.cosformer_expt_attn_enable
+        self.combin_attn_enable = args.combin_attn_enable
+        self.combin_expt_attn_enable = args.combin_expt_attn_enable
+
+        self.load_simul_attn_chkpts = args.load_simul_attn_chkpts
+
+        self.max_src_len_step_size = args.max_src_len_step_size
+       
+        # used to initialize transformations as a LUT for fully linearized attention
+        self.chkpt_tr_inter = {}
+        if self.load_simul_attn_chkpts:
+            idx = torch.zeros(768)
+            for i in range(768):
+                idx[i] = i
+            
+            loop_len = math.ceil(768 / self.max_src_len_step_size)
+
+            if self.cosformer_attn_enable:
+                self.chkpt_tr_inter["sin_tr"] = {}
+                self.chkpt_tr_inter["cos_tr"] = {}
+                for i in range(loop_len):
+                    self.chkpt_tr_inter["sin_tr"][i] = torch.sin((3.1415*idx+0.001)/(2*(i + 1)*self.max_src_len_step_size))
+                    self.chkpt_tr_inter["cos_tr"][i] = torch.cos((3.1415*idx+0.001)/(2*(i + 1)*self.max_src_len_step_size))
+            elif self.cosformer_expt_attn_enable:
+                self.chkpt_tr_inter["sin_tr"] = torch.sin((3.1415*(1 - torch.exp(-1 * idx)+0.001)/2)
+                self.chkpt_tr_inter["cos_tr"] = torch.cos((3.1415*(1 - torch.exp(-1 * idx)+0.001)/2)
+            elif self.combin_attn_enable:
+                self.chkpt_tr_inter["j_tr"] = {}
+                self.chkpt_tr_inter["j_ttr"] = {}
+                for i in range(loop_len):
+                    temp_idx = (idx[:((i + 1)*self.max_src_len_step_size)] + 0.1) / ((i + 1) * self.max_src_len_step_size)
+                    self.chkpt_tr_inter["j_tr"][i] = temp_idx
+                    self.chkpt_tr_inter["j_ttr"][i] = torch.square(temp_idx)
+            elif self.combin_expt_attn_enable:
+                self.chkpt_tr_inter["j_tr"] = torch.exp(-1 * idx)
+                self.chkpt_tr_inter["j_ttr"] = torch.exp(-2 * idx)
 
         self.force_finish = args.force_finish
+        
+        self.flush_method = args.flush_method
+        print(f"Flush method set to: {self.flush_method}", flush=True)
 
         torch.set_grad_enabled(False)
 
@@ -189,6 +233,8 @@ class FairseqSimulSTAgent(SpeechAgent):
                             help="User directory for simultaneous translation")
         parser.add_argument("--max-len", type=int, default=200,
                             help="Max length of translation")
+        parser.add_argument("--max-len-after-finish-read", type=int, default=25,
+                            help="Max length of translation after finished reading")
         parser.add_argument("--force-finish", default=False, action="store_true",
                             help="Force the model to finish the hypothsis if the source is not finished")
         parser.add_argument("--shift-size", type=int, default=SHIFT_SIZE,
@@ -201,7 +247,20 @@ class FairseqSimulSTAgent(SpeechAgent):
                             help="Acoustic feature dimension.")
         parser.add_argument("--waitk", type=int, default=None,
                             help="Wait-k delay for evaluation")
-
+        parser.add_argument("--flush-method", type=str, default="none",
+                            help="Method used to flush state after each sentence and enable more continuous operation.")
+        parser.add_argument("--cosformer-attn-enable", default=False, action="store_true",
+                            help="Switch to enable cosformer-attn during inference.")
+        parser.add_argument("--cosformer_expt-attn-enable", default=False, action="store_true",
+                            help="Switch to enable cosformer_expt-attn during inference.")
+        parser.add_argument("--combin-attn-enable", default=False, action="store_true",
+                            help="Switch to enable combin-attn during inference.")
+        parser.add_argument("--combin-expt-attn-enable", default=False, action="store_true",
+                            help="Switch to enable combin-expt-attn during inference.")
+        parser.add_argument("--load-simul-attn-chkpts", default=False, action="store_true",
+                            help="Switch to enable fully linearized attention at inference.")
+        parser.add_argument("--max-src-len-step-size", type=int, default=128,
+                            help="Max length stepping size in attention calculations at inference. Useful for quadratic/fully linearized inference.")
         # fmt: on
         return parser
 
@@ -221,16 +280,22 @@ class FairseqSimulSTAgent(SpeechAgent):
 
         if args.waitk is not None:
             state["cfg"]["model"].waitk_lagging = args.waitk
+            self.waitk_lagging = args.waitk
+        else:
+            self.waitk_lagging = state["cfg"]["model"].waitk_lagging
         
         task = tasks.setup_task(task_args)
 
         # build model for ensemble
         state["cfg"]["model"].load_pretrained_encoder_from = None
         state["cfg"]["model"].load_pretrained_decoder_from = None
+        state["cfg"]["model"].cosformer_attn_enable = args.cosformer_attn_enable
         self.model = task.build_model(state["cfg"]["model"])
         self.model.load_state_dict(state["model"], strict=True)
         self.model.eval()
         self.model.share_memory()
+
+        #print(self.model)
 
         if self.gpu:
             self.model.cuda()
@@ -244,6 +309,63 @@ class FairseqSimulSTAgent(SpeechAgent):
         states.units.source = TensorListEntry()
         states.units.target = ListEntry()
         states.incremental_states = dict()
+        self.simul_attn_chkpts = dict()
+
+        if self.load_simul_attn_chkpts:
+            
+            loop_len = math.ceil(768 / self.max_src_len_step_size)
+
+            if self.cosformer_attn_enable:
+                self.simul_attn_chkpts["sin_tr"] = {}
+                self.simul_attn_chkpts["cos_tr"] = {}
+                for i in range(loop_len):
+                    self.simul_attn_chkpts["sin_tr"][i] = self.chkpt_tr_inter["sin_tr"][i]
+                    self.simul_attn_chkpts["cos_tr"][i] = self.chkpt_tr_inter["cos_tr"][i]
+            elif self.cosformer_expt_attn_enable:
+                self.chkpt_tr_inter["sin_tr"] = self.chkpt_tr_inter["sin_tr"]
+                self.chkpt_tr_inter["cos_tr"] = self.chkpt_tr_inter["cos_tr"]
+            elif self.combin_attn_enable:
+                self.simul_attn_chkpts["j_tr"] = {}
+                self.simul_attn_chkpts["j_ttr"] = {}
+                for i in range(loop_len):
+                    self.simul_attn_chkpts["j_tr"][i] = self.chkpt_tr_inter["j_tr"][i]
+                    self.simul_attn_chkpts["j_ttr"][i] = self.chkpt_tr_inter["j_ttr"][i]
+            elif self.combin_expt_attn_enable:
+                self.simul_attn_chkpts["j_tr"] = self.chkpt_tr_inter["j_tr"]
+                self.simul_attn_chkpts["j_ttr"] = self.chkpt_tr_inter["j_tr"]
+
+            
+            model_size = len(self.model.encoder.transformer_layers) + len(self.model.decoder.layers)
+            self.simul_attn_chkpts["layers"] = {}
+            for i in range(model_size):
+                self.simul_attn_chkpts["layers"][i] = {}
+                self.simul_attn_chkpts["layers"][i]["self_attn"] = {}
+                self.simul_attn_chkpts["layers"][i]["cross_attn"] = {}
+                
+                if self.cosformer_attn_enable or self.cosformer_expt_attn_enable:
+                    self.simul_attn_chkpts["layers"][i]["self_attn"]["norm_sin"] = None
+                    self.simul_attn_chkpts["layers"][i]["self_attn"]["norm_cos"] = None
+                    self.simul_attn_chkpts["layers"][i]["self_attn"]["k_sin"] = None
+                    self.simul_attn_chkpts["layers"][i]["self_attn"]["k_cos"] = None
+                    self.simul_attn_chkpts["layers"][i]["self_attn"]["kTv_sin"] = None
+                    self.simul_attn_chkpts["layers"][i]["self_attn"]["kTv_cos"] = None
+                elif self.combin_attn_enable or self.combin_expt_attn_enable:
+                    self.simul_attn_chkpts["layers"][i]["self_attn"]["norm"] = None
+                    self.simul_attn_chkpts["layers"][i]["self_attn"]["norm_t"] = None
+                    self.simul_attn_chkpts["layers"][i]["self_attn"]["norm_tt"] = None
+                    self.simul_attn_chkpts["layers"][i]["self_attn"]["k_t"] = None
+                    self.simul_attn_chkpts["layers"][i]["self_attn"]["k_tt"] = None
+                    self.simul_attn_chkpts["layers"][i]["self_attn"]["attn_weights"] = None
+                    self.simul_attn_chkpts["layers"][i]["self_attn"]["attn_weights_kt"] = None
+                    self.simul_attn_chkpts["layers"][i]["self_attn"]["attn_weights_ktt"] = None
+
+        self.simul_attn_chkpts["old_indices"] = {
+            "src": 0,
+            "tgt": 0,
+        }
+        
+        self.past_finish_read = 0
+
 
     def segment_to_units(self, segment, states):
         # Convert speech samples to features
@@ -255,16 +377,27 @@ class FairseqSimulSTAgent(SpeechAgent):
 
     def units_to_segment(self, units, states):
         # Merge sub word to full word.
-        if self.model.decoder.dictionary.eos() == units[0]:
-            return DEFAULT_EOS
-
-        segment = []
+        
         if None in units.value:
             units.value.remove(None)
 
-        for index in units:
-            if index is None:
+        # Check for special conditions
+        if len(units) < 1:
+            return None
+        elif (
+            (self.model.decoder.dictionary.eos() == units[-1])
+            or (('<e>' == self.model.decoder.dictionary.string([units[-1]])) and states.finish_read())
+            or (len(states.units.target) > self.max_len)
+            or (self.past_finish_read > self.max_len_after_finish_read)
+        ):
+            tokens = [self.model.decoder.dictionary.string([unit]) for unit in units]
+            for j in range(len(units)):
                 units.pop()
+            return ["".join(tokens).replace(BOW_PREFIX, "")] + [DEFAULT_EOS]
+
+        # Regular handling if no special conditions
+        segment = []
+        for index in units:
             token = self.model.decoder.dictionary.string([index])
             if token.startswith(BOW_PREFIX):
                 if len(segment) == 0:
@@ -282,17 +415,10 @@ class FairseqSimulSTAgent(SpeechAgent):
             else:
                 segment += [token.replace(BOW_PREFIX, "")]
 
-        if (
-            len(units) > 0
-            and self.model.decoder.dictionary.eos() == units[-1]
-            or len(states.units.target) > self.max_len
-        ):
-            tokens = [self.model.decoder.dictionary.string([unit]) for unit in units]
-            return ["".join(tokens).replace(BOW_PREFIX, "")] + [DEFAULT_EOS]
-
         return None
 
     def update_model_encoder(self, states):
+        #print(f"States.units.source len: {len(states.units.source)}", flush=True)
         if len(states.units.source) == 0:
             return
         src_indices = self.to_device(
@@ -311,7 +437,10 @@ class FairseqSimulSTAgent(SpeechAgent):
 
     def policy(self, states):
         if not getattr(states, "encoder_states", None):
-            return READ_ACTION
+            if states.finish_read():
+                return WRITE_ACTION
+            else:
+                return READ_ACTION
 
         tgt_indices = self.to_device(
             torch.LongTensor(
@@ -319,6 +448,7 @@ class FairseqSimulSTAgent(SpeechAgent):
                 + [x for x in states.units.target.value if x is not None]
             ).unsqueeze(0)
         )
+        #print(tgt_indices)
 
         states.incremental_states["steps"] = {
             "src": states.encoder_states["encoder_out"][0].size(0),
@@ -326,25 +456,40 @@ class FairseqSimulSTAgent(SpeechAgent):
         }
 
         states.incremental_states["online"] = {"only": torch.tensor(not states.finish_read())}
-
-        x, outputs = self.model.decoder.forward(
-            prev_output_tokens=tgt_indices,
-            encoder_out=states.encoder_states,
-            incremental_state=states.incremental_states,
-        )
-
+        
+        if self.load_simul_attn_chkpts:
+            x, outputs = self.model.decoder.forward(
+                prev_output_tokens=tgt_indices,
+                encoder_out=states.encoder_states,
+                incremental_state=states.incremental_states,
+                simul_attn_chkpts=self.simul_attn_chkpts,
+            )
+            self.simul_attn_chkpts["old_indices"] = states.incremental_states["steps"]
+        else:
+            x, outputs = self.model.decoder.forward(
+                prev_output_tokens=tgt_indices,
+                encoder_out=states.encoder_states,
+                incremental_state=states.incremental_states,
+            )
+        
         states.decoder_out = x
 
         states.decoder_out_extra = outputs
 
         torch.cuda.empty_cache()
 
-        if outputs.action == 0:
+        if (outputs.action == 0) and (not states.finish_read()):
             return READ_ACTION
         else:
+            if states.finish_read():
+                self.past_finish_read += 1
+                print(f"Past finish: {self.past_finish_read}", flush=True)
             return WRITE_ACTION
 
     def predict(self, states):
+        if not getattr(states, "encoder_states", None):
+            return self.model.decoder.dictionary.eos()
+        
         decoder_states = states.decoder_out
 
         lprobs = self.model.get_normalized_probs(
@@ -354,6 +499,8 @@ class FairseqSimulSTAgent(SpeechAgent):
         index = lprobs.argmax(dim=-1)
 
         index = index[0, 0].item()
+
+        #print(f"Incremental predicted output: {self.model.decoder.dictionary.string([index])}", flush=True)
 
         if (
             self.force_finish
@@ -366,3 +513,40 @@ class FairseqSimulSTAgent(SpeechAgent):
             index = None
 
         return index
+
+    def flush(self, states):
+        if (self.flush_method is not None) and (self.flush_method != "no_flush"):
+            flush_method = self.flush_method
+            
+            #print(f"Source len before flush: {len(states.units.source)}", flush=True)
+            if states.finish_read():
+                # Force finish translation since, assuming we are keeping up with translation, there is no additional sentence to translate
+                states.units.source = TensorListEntry()
+                states.encoder_states = None
+            else:
+                # For all methods, take into account pre_decision_ratio & downsampling factor from conv)
+                if flush_method == 'naive':
+                    # Naively flush entire source (except one segment for correctness)
+                    flush_amount = 1 * 4 * self.model.decoder.layers[0].encoder_attn.pre_decision_ratio
+                    states.units.source.value = states.units.source.value[-flush_amount:]
+                    self.update_states_read(states)
+                elif flush_method == 'keep_last_k':    
+                    # Flush up to last k elements of source
+                    # Roughly the amount that needs to be translated if we still have additional audio to process
+                    flush_amount = self.waitk_lagging * 4 * self.model.decoder.layers[0].encoder_attn.pre_decision_ratio
+                    states.units.source.value = states.units.source.value[-flush_amount:]
+                    self.update_states_read(states)
+                elif flush_method == 'decoder_sync':    
+                    # Flush number of elements from source that have been translated by decoder
+                    #print(f"Target units: {states.units.target}", flush=True)
+                    flush_amount = int( 0.75 * len(states.units.target)  * 4 * self.model.decoder.layers[0].encoder_attn.pre_decision_ratio )
+                    #print(f"Flush amount: {flush_amount}", flush=True)
+                    states.units.source.value = states.units.source.value[flush_amount:]
+                    if len(states.units.source) >= ( 4 * self.model.decoder.layers[0].encoder_attn.pre_decision_ratio):
+                        self.update_states_read(states)
+                    else:
+                        states.encoder_states = None
+            #print(f"Source len after flush: {len(states.units.source)}", flush=True)
+            
+            states.units.target = ListEntry()
+            states.incremental_states = dict()

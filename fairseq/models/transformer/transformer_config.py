@@ -234,6 +234,30 @@ class TransformerConfig(FairseqDataclass):
         default=False,
         metadata={"help": "Use simple attention without softmax, as proposed by https://arxiv.org/pdf/2111.15588.pdf"},
     )
+    cosformer_attn_enable: bool = field(
+        default=False,
+        metadata={"help": "Replace softmax with ReLU and cosine-based transform as proposed by the paper introducing cosFormer"},
+    )
+    cosformer_expt_attn_enable: bool = field(
+        default=False,
+        metadata={"help": "Replace softmax with ReLU and cosine-based transform as proposed by the paper introducing cosFormer. Added exponential component."},
+    )
+    combin_attn_enable: bool = field(
+        default=False,
+        metadata={"help": "Replace softmax with ReLU and combin based transform"},
+    )
+    combin_expt_attn_enable: bool = field(
+        default=False,
+        metadata={"help": "Replace softmax with ReLU and combin expt based transform"},
+    )
+    disable_norm_stretch_factor: bool = field(
+        default=False,
+        metadata={"help": "Only matters for quadratic/linear runtime solutions for online applications. Allows for a stretch of the normalization tensor to resemble full sentence normalization."},
+    )
+    max_src_len_step_size: int = field(
+        default=128,
+        metadata={"help": "Sets the thresholding steps for the maximum src len in quadratic and fully linearized applications. Useful primarily for cosFormer."},
+    )
 
 
     # We need to make this hierarchical dataclass like the flat namespace

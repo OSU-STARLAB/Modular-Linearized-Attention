@@ -48,9 +48,11 @@ class TransformerMonotonicDecoderLayer(TransformerDecoderLayer):
     def forward(
         self,
         x,
+        layer_idx = None,
         encoder_out: Optional[Tensor] = None,
         encoder_padding_mask: Optional[Tensor] = None,
         incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
+        simul_attn_chkpts: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
         prev_self_attn_state: Optional[List[Tensor]] = None,
         prev_attn_state: Optional[List[Tensor]] = None,
         self_attn_mask: Optional[Tensor] = None,
@@ -118,9 +120,13 @@ class TransformerMonotonicDecoderLayer(TransformerDecoderLayer):
             value=y,
             key_padding_mask=self_attn_padding_mask,
             incremental_state=incremental_state,
+            simul_attn_chkpts=simul_attn_chkpts,
+            layer_idx=layer_idx,
             need_weights=False,
             attn_mask=self_attn_mask,
         )
+
+        #print(f"Decoder self-attn shape: {x.shape}")
         x = self.dropout_module(x)
         x = self.residual_connection(x, residual)
         if not self.normalize_before:
@@ -151,6 +157,7 @@ class TransformerMonotonicDecoderLayer(TransformerDecoderLayer):
             need_weights=need_attn or (not self.training and self.need_attn),
             need_head_weights=need_head_weights,
         )
+        #print(f"Attn output shape: {x.shape}")
         x = self.dropout_module(x)
         x = self.residual_connection(x, residual)
         if not self.normalize_before:
@@ -179,4 +186,4 @@ class TransformerMonotonicDecoderLayer(TransformerDecoderLayer):
             else:
                 self_attn_state = [saved_state["prev_key"], saved_state["prev_value"]]
             return x, attn, self_attn_state
-        return x, attn, None
+        return x, attn

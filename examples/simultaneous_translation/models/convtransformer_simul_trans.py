@@ -57,6 +57,18 @@ class SimulConvTransformerModel(ConvTransformerModel):
             metavar="N",
             help="Specify size of input blocks for which block attention is allowed. Useful when inputs will be grouped following encoder (e.g., simultaneous translation using wait-k). Default=1 (no additional attention)",
         )
+#        parser.add_argument(
+#            "--cosformer-attn-enable",
+#            action="store_true",
+#            default=False,
+#            help="Switch to enable cosformer attn mechanics",
+#        )
+#        parser.add_argument(
+#            "load-simul-attn-chkpts",
+#            action="store_true",
+#            defualt=False,
+#            help="Switch to enable caching mechanisms for linearized attention",
+#        )
 
     @classmethod
     def build_decoder(cls, args, task, embed_tokens):
