@@ -290,6 +290,7 @@ class MultiheadAttention(nn.Module):
         incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
         simul_attn_chkpts: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
         layer_idx = None,
+        is_tpu = False,
     ):
 
         assert v is not None
@@ -297,16 +298,10 @@ class MultiheadAttention(nn.Module):
         assert k is not None
         
         if key_padding_mask is not None:
-            #print(f"We have a padding mask. {key_padding_mask.shape}\n{key_padding_mask}")
-            #print(f"Pre unsqueeze on mask: {key_padding_mask.shape}")
-            #print(f"Pre unsqueeze on k: {k.shape}")
-            key_pad_mask_unsqueeze = key_padding_mask.unsqueeze(1).unsqueeze(3).to(torch.bool)
-            #print(f"Post unsqueeze shape: {key_pad_mask_unsqueeze.shape}")
-            k = k.view(bsz, self.num_heads, src_len, list(k.shape)[2])
-            #print(f"k after view: {k.shape}")
+            key_pad_mask_unsqueeze = key_padding_mask.unsqueeze(1).unsqueeze(-1).to(torch.bool)
+            k = k.view(bsz, self.num_heads, src_len, list(k.shape)[2])          
             k = k.masked_fill(key_pad_mask_unsqueeze, 0)
             k = k.view(bsz*self.num_heads, src_len, list(k.shape)[3])          
-            #print(f"k after final view: {k.shape}")
 
         q_sin_init = q
         q_cos_init = q
@@ -326,8 +321,6 @@ class MultiheadAttention(nn.Module):
         # use this for src length thresholding, 10% of max src_len step size is used to avoid bias towards early end of sentence characters
         src_len_p = math.floor((src_len + math.floor(self.max_src_len_step_size / 10)) / self.max_src_len_step_size)
 
-        #print(f"A few values of interest: src_len {src_len}, max step {self.max_src_len_step_size}, src_len_p {src_len_p}")
-        
         if incremental_state is not None:
             src_idx = incremental_state["steps"]["src"]
             tgt_idx = incremental_state["steps"]["tgt"]
@@ -381,9 +374,13 @@ class MultiheadAttention(nn.Module):
             for i in range(src_len):
                 idx[i] = i
 
-            #print(f"Some values of interest: k {k.shape}, q {q.shape}, src_len {src_len}")
-            sin_tr = torch.sin((3.1415*idx+0.001)/(2*(src_len_p + 1)*self.max_src_len_step_size))
-            cos_tr = torch.cos((3.1415*idx+0.001)/(2*(src_len_p + 1)*self.max_src_len_step_size))
+            if self.cosformer_attn_enable:
+                sin_tr = torch.sin((3.1415*idx+0.001)/(2*(src_len_p + 1)*self.max_src_len_step_size))
+                cos_tr = torch.cos((3.1415*idx+0.001)/(2*(src_len_p + 1)*self.max_src_len_step_size))
+            elif self.cosformer_expt_attn_enable:
+                sin_tr = torch.sin((3.1415*(1 - torch.exp(-1 * idx))+0.001)/2)
+                cos_tr = torch.cos((3.1415*(1 - torch.exp(-1 * idx))+0.001)/2)
+            
             sin_tr = sin_tr.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
             cos_tr = cos_tr.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
 
@@ -403,8 +400,6 @@ class MultiheadAttention(nn.Module):
             k_cos = torch.matmul(k_cos_init.unsqueeze(-1), cos_tr).squeeze(-1)
             norm_sin = torch.cumsum(k_sin, dim=1).transpose(1, 2)
             norm_cos = torch.cumsum(k_cos, dim=1).transpose(1, 2)
-            #print(f"Self_attn values: q: {q.shape}, k: {k.shape}, kT: {k_sin.transpose(1, 2).shape}, v: {v.shape}")
-            #print(f"Norm sin values: {norm_sin.shape}")
 
         # build out d x d intermediate matrix
         if simul_attn_chkpts is not None:
@@ -435,9 +430,6 @@ class MultiheadAttention(nn.Module):
        
         # remaining computation
         if incremental_state is not None:
-            #print(simul_attn_chkpts["kTv_update"])
-            #if old_attn_weights_v_sin is not None:
-            #    print(simul_attn_chkpts["layers"][layer_idx]["self_attn"]["kTv_sin"].shape)
             attn_weights_sin = torch.bmm(q_sin, attn_weights_v_sin)
             attn_weights_cos = torch.bmm(q_cos, attn_weights_v_cos)
             attn_weights = attn_weights_sin + attn_weights_cos
@@ -459,15 +451,6 @@ class MultiheadAttention(nn.Module):
 
             attn = attn_probs
 
-            #print(q.shape)
-            #print(q.shape)
-            #print(k.shape)
-            #print(v.shape)
-            #print("---")
-            #print(k_sin.shape)
-            #print(v.shape)
-            #print(attn_weights_v_sin.shape)
-            #print(attn.shape)
             attn = attn.transpose(0, 1).contiguous().view(1, bsz, self.embed_dim)
             attn = self.out_proj(attn)
 
@@ -485,289 +468,10 @@ class MultiheadAttention(nn.Module):
         else:
             attn_weights = attn_weights_v_sin + attn_weights_v_cos
            
-            #print(f"Quick check on some sizing. q {q.shape}, k {k.shape}, v {v.shape}, attn_weights {attn_weights.shape}") 
             if attn_mask is not None:
                 attn_mask_bool = attn_mask.to(torch.bool)
                 attn_weights = attn_weights.masked_fill(attn_mask_bool, 0)
-            
-            #print(f"Before resizing: {attn_weights.shape}")
-            #attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
-            #attn_weights = attn_weights.transpose(0, 2)
-            #print(f"Before key_padding mask: {attn_weights.shape}")
-            #if key_padding_mask is not None:
-            #    attn_weights = attn_weights.masked_fill(key_padding_mask, 0)
-            #print(f"After key_padding mask: {attn_weights.shape}")
-            #attn_weights = attn_weights.contiguous().view(bsz * self.num_heads, tgt_len, src_len)
-            #print(f"After key_padding mask and view: {attn_weights.shape}")
-            
-            attn_weights = torch.bmm(attn_weights, v)
-
-            attn_probs = self.dropout_module(attn_weights)
-
-            # expanding normalizing vector to 768, accounting for size
-            if self.enable_norm_stretch_factor:
-                norm_stretch_factor = (src_len_p + 1) * self.max_src_len_step_size / list(k.shape)[1]
-            else:
-                norm_stretch_factor = 1
-
-            # section to try and replicate casual relationship in normalization
-            #norm_sin = torch.cumsum(k_sin.unsqueeze(-1), dim=1).squeeze(-1).transpose(1, 2)
-            #norm_cos = torch.cumsum(k_cos.unsqueeze(-1), dim=1).squeeze(-1).transpose(1, 2)
-            #print(f"Quick check for shapes: norm_sin {norm_sin.shape}, q_sin {q_sin.shape}")
-
-            prob_norm_sin = torch.bmm(q_sin, norm_stretch_factor * norm_sin)
-            prob_norm_cos = torch.bmm(q_cos, norm_stretch_factor * norm_cos)
-            prob_norm = prob_norm_sin + prob_norm_cos
-
-            #print(f"Prob norm: {prob_norm.shape}")
-
-            prob_norm = torch.diagonal(prob_norm, dim1=1, dim2=2).unsqueeze(-1)
-            
-            #print(f"Prob norm after diag: {prob_norm.shape}")
-
-            #print(f"Attn weights: {attn_weights.shape}")
-            
-            #prob_norm.expand(list(prob_norm.shape)[0], list(prob_norm.shape)[1], list(attn_weights.shape)[2])
-            prob_norm = torch.clamp_min(prob_norm, 0.1)
-            
-            attn = attn_weights / prob_norm
-
-            #attn_weights_float = attn_weights.type(torch.float32)
-            #denom = torch.clamp_min(norm_stretch_factor * attn_weights_float.sum(dim=-1, keepdim=True), 0.1)
-            #attn_weights_float = attn_weights_float / denom
-            
-            #attn_weights = attn_weights_float.type_as(attn_weights)
-
-            #attn = torch.bmm(attn_probs, v)
-
-            #print(f"Quick check to ensure proper attention shape: {attn.shape}")
-            attn = attn.transpose(0, 1).contiguous().view(src_len, bsz, self.embed_dim)
-            attn = self.out_proj(attn)
-
-            return attn, attn_weights
-    
-    def cosformer_expt_attn_train_and_infer(
-        self,
-        q,
-        k: Optional[Tensor],
-        v: Optional[Tensor],
-        src_len = None,
-        bsz = None,
-        key_padding_mask: Optional[Tensor] = None,
-        attn_mask: Optional[Tensor] = None,
-        incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
-        simul_attn_chkpts: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
-        layer_idx = None,
-    ):
-
-        assert v is not None
-        assert q is not None
-        assert k is not None
-        
-        if key_padding_mask is not None:
-            #print(f"We have a padding mask. {key_padding_mask.shape}\n{key_padding_mask}")
-            #print(f"Pre unsqueeze on mask: {key_padding_mask.shape}")
-            #print(f"Pre unsqueeze on k: {k.shape}")
-            key_pad_mask_unsqueeze = key_padding_mask.unsqueeze(1).unsqueeze(3).to(torch.bool)
-            #print(f"Post unsqueeze shape: {key_pad_mask_unsqueeze.shape}")
-            k = k.view(bsz, self.num_heads, src_len, list(k.shape)[2])
-            #print(f"k after view: {k.shape}")
-            k = k.masked_fill(key_pad_mask_unsqueeze, 0)
-            k = k.view(bsz*self.num_heads, src_len, list(k.shape)[3])          
-            #print(f"k after final view: {k.shape}")
-
-        q_sin_init = q
-        q_cos_init = q
-        k_sin_init = k
-        k_cos_init = k
-        q_sin = torch.zeros(q.shape, device=q.device)
-        q_cos = torch.zeros(q.shape, device=q.device)
-        k_sin = torch.zeros(k.shape, device=k.device)
-        k_cos = torch.zeros(k.shape, device=k.device)
-        idx = torch.zeros(src_len, device = k.device)
-        norm_sin = torch.zeros(list(k.shape)[0], list(k.shape)[2], 1, device=k.device)
-        norm_cos = torch.zeros(list(k.shape)[0], list(k.shape)[2], 1, device=k.device)
-        old_tgt = 0
-        
-        tgt_len = list(q.shape)[1]
-
-        # use this for src length thresholding, 10% of max src_len step size is used to avoid bias towards early end of sentence characters
-        src_len_p = math.floor((src_len + math.floor(self.max_src_len_step_size / 10)) / self.max_src_len_step_size)
-
-        #print(f"A few values of interest: src_len {src_len}, max step {self.max_src_len_step_size}, src_len_p {src_len_p}")
-        
-        if incremental_state is not None:
-            src_idx = incremental_state["steps"]["src"]
-            tgt_idx = incremental_state["steps"]["tgt"]
-
-        # should strongly consider changing 2*src_len to 768 or some other constant
-        if simul_attn_chkpts is not None:
-            src_idx = incremental_state["steps"]["src"]
-            tgt_idx = incremental_state["steps"]["tgt"]
-            old_src_idx = simul_attn_chkpts["old_indices"]["src"]
-            old_tgt_idx = simul_attn_chkpts["old_indices"]["tgt"]
-            q_sin = torch.mul(q_sin_init, math.sin((3.1415*(1 - math.exp(-1 * (tgt_idx - 1))) + 0.001)/2))
-            q_cos = torch.mul(q_cos_init, math.cos((3.1415*(1 - math.exp(-1 * (tgt_idx - 1))) + 0.001)/2))
-            sin_tr = simul_attn_chkpts["sin_tr"]
-            cos_tr = simul_attn_chkpts["cos_tr"]
-
-            k_sin_old = simul_attn_chkpts["layers"][layer_idx]["self_attn"]["k_sin"]
-            k_cos_old = simul_attn_chkpts["layers"][layer_idx]["self_attn"]["k_cos"]
-            norm_sin_old = simul_attn_chkpts["layers"][layer_idx]["self_attn"]["norm_sin"]
-            norm_cos_old = simul_attn_chkpts["layers"][layer_idx]["self_attn"]["norm_cos"]
-
-            # build key transforms if necessary
-            if k_sin_old is not None and k_cos_old is not None:
-                old_tgt = list(k_sin_old.shape)[1]
-                if old_tgt == tgt_idx:
-                    k_sin = k_sin_old
-                    k_cos = k_cos_old
-                else:
-                    sin_tr = sin_tr[old_tgt:tgt_idx].unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-                    cos_tr = cos_tr[old_tgt:tgt_idx].unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-                    k_sin = torch.cat((k_sin_old, torch.matmul(k_sin_init[:, old_tgt:, :].unsqueeze(-1), sin_tr).squeeze(-1)), dim=1)
-                    k_cos = torch.cat((k_cos_old, torch.matmul(k_cos_init[:, old_tgt:, :].unsqueeze(-1), cos_tr).squeeze(-1)), dim=1)
-            else:
-                sin_tr = sin_tr[:tgt_idx].unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-                cos_tr = cos_tr[:tgt_idx].unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-                k_sin = torch.matmul(k_sin_init.unsqueeze(-1), sin_tr).squeeze(-1)
-                k_cos = torch.matmul(k_cos_init.unsqueeze(-1), cos_tr).squeeze(-1)
-
-            # build normalization vectors if necessary
-            if norm_sin_old is not None and norm_cos_old is not None:
-                if old_tgt == tgt_idx:
-                    norm_sin = norm_sin_old
-                    norm_cos = norm_cos_old
-                else:
-                    norm_sin = norm_sin_old + torch.sum(k_sin.unsqueeze(-1)[:, old_tgt:, :], dim=1)
-                    norm_cos = norm_cos_old + torch.sum(k_cos.unsqueeze(-1)[:, old_tgt:, :], dim=1)
-            else:
-                norm_sin = torch.sum(k_sin.unsqueeze(-1), dim=1)
-                norm_cos = torch.sum(k_cos.unsqueeze(-1), dim=1)
-
-        else:
-            for i in range(src_len):
-                idx[i] = i
-
-            #print(f"Some values of interest: k {k.shape}, q {q.shape}, src_len {src_len}")
-            sin_tr = torch.sin((3.1415*(1 - torch.exp(-1 * idx))+0.001)/2)
-            cos_tr = torch.cos((3.1415*(1 - torch.exp(-1 * idx))+0.001)/2)
-            sin_tr = sin_tr.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-            cos_tr = cos_tr.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-
-            
-            if incremental_state is not None:
-                q_sin = torch.matmul(q_sin_init.unsqueeze(-1), sin_tr[:, tgt_idx - 1, :, :])
-                q_sin = torch.clamp_min(q_sin.squeeze(-1), 0.01)
-                q_cos = torch.matmul(q_cos_init.unsqueeze(-1), cos_tr[:, tgt_idx - 1, :, :])
-                q_cos = torch.clamp_min(q_cos.squeeze(-1), 0.01)
-            else:    
-                q_sin = torch.matmul(q_sin_init.unsqueeze(-1), sin_tr)
-                q_sin = torch.clamp_min(q_sin.squeeze(-1), 0.01)
-                q_cos = torch.matmul(q_cos_init.unsqueeze(-1), cos_tr)
-                q_cos = torch.clamp_min(q_cos.squeeze(-1), 0.01)
-            
-            k_sin = torch.matmul(k_sin_init.unsqueeze(-1), sin_tr).squeeze(-1)
-            k_cos = torch.matmul(k_cos_init.unsqueeze(-1), cos_tr).squeeze(-1)
-            norm_sin = torch.cumsum(k_sin, dim=1).transpose(1, 2)
-            norm_cos = torch.cumsum(k_cos, dim=1).transpose(1, 2)
-            #print(f"Self_attn values: q: {q.shape}, k: {k.shape}, kT: {k_sin.transpose(1, 2).shape}, v: {v.shape}")
-            #print(f"Norm sin values: {norm_sin.shape}")
-
-        # build out d x d intermediate matrix
-        if simul_attn_chkpts is not None:
-            old_attn_weights_v_sin = simul_attn_chkpts["layers"][layer_idx]["self_attn"]["kTv_sin"]
-            old_attn_weights_v_cos = simul_attn_chkpts["layers"][layer_idx]["self_attn"]["kTv_cos"]
-
-            if old_attn_weights_v_sin is not None and old_attn_weights_v_cos is not None:
-                if old_tgt == tgt_idx:
-                    attn_weights_v_sin = old_attn_weights_v_sin
-                    attn_weights_v_cos = old_attn_weights_v_cos
-                else:
-                    attn_weights_v_sin = old_attn_weights_v_sin + torch.bmm(k_sin[:, old_tgt:, :].transpose(1, 2), v[:, old_tgt:, :]) 
-                    attn_weights_v_cos = old_attn_weights_v_cos + torch.bmm(k_cos[:, old_tgt:, :].transpose(1, 2), v[:, old_tgt:, :])
-            else:
-                attn_weights_v_sin = torch.bmm(k_sin.transpose(1, 2), v)
-                attn_weights_v_cos = torch.bmm(k_cos.transpose(1, 2), v)
-
-        else:
-            # used for cosformer quadratic attention
-            if incremental_state is not None:
-                attn_weights_v_sin = torch.bmm(k_sin.transpose(1, 2), v)
-                attn_weights_v_cos = torch.bmm(k_cos.transpose(1, 2), v)
-            
-            # training only behavior, non-linearized with respect to number of samples
-            else:
-                attn_weights_v_sin = torch.bmm(q_sin, k_sin.transpose(1, 2))
-                attn_weights_v_cos = torch.bmm(q_cos, k_cos.transpose(1, 2))
-       
-        # remaining computation
-        if incremental_state is not None:
-            #print(simul_attn_chkpts["kTv_update"])
-            #if old_attn_weights_v_sin is not None:
-            #    print(simul_attn_chkpts["layers"][layer_idx]["self_attn"]["kTv_sin"].shape)
-            attn_weights_sin = torch.bmm(q_sin, attn_weights_v_sin)
-            attn_weights_cos = torch.bmm(q_cos, attn_weights_v_cos)
-            attn_weights = attn_weights_sin + attn_weights_cos
-
-            # expanding normalizing vector to 768, accounting for size
-            if self.enable_norm_stretch_factor:
-                norm_stretch_factor = (src_len_p + 1) * self.max_src_len_step_size / list(k.shape)[1]
-            else:
-                norm_stretch_factor = 1
-
-            prob_norm_sin = torch.bmm(q_sin, norm_stretch_factor * norm_sin)
-            prob_norm_cos = torch.bmm(q_cos, norm_stretch_factor * norm_cos)
-            prob_norm = prob_norm_sin + prob_norm_cos
-
-            prob_norm.expand(list(prob_norm.shape)[0], list(prob_norm.shape)[1], list(attn_weights.shape)[2])
-            prob_norm = torch.clamp_min(prob_norm, 0.1)
-
-            attn_probs = attn_weights / prob_norm
-
-            attn = attn_probs
-
-            #print(q.shape)
-            #print(q.shape)
-            #print(k.shape)
-            #print(v.shape)
-            #print("---")
-            #print(k_sin.shape)
-            #print(v.shape)
-            #print(attn_weights_v_sin.shape)
-            #print(attn.shape)
-            attn = attn.transpose(0, 1).contiguous().view(1, bsz, self.embed_dim)
-            attn = self.out_proj(attn)
-
-            if simul_attn_chkpts is not None:
-                simul_attn_chkpts["layers"][layer_idx]["self_attn"]["norm_sin"] = norm_sin
-                simul_attn_chkpts["layers"][layer_idx]["self_attn"]["norm_cos"] = norm_cos
-                simul_attn_chkpts["layers"][layer_idx]["self_attn"]["k_sin"] = k_sin
-                simul_attn_chkpts["layers"][layer_idx]["self_attn"]["k_cos"] = k_cos
-                simul_attn_chkpts["layers"][layer_idx]["self_attn"]["kTv_sin"] = attn_weights_v_sin
-                simul_attn_chkpts["layers"][layer_idx]["self_attn"]["kTv_cos"] = attn_weights_v_cos
-
-            return attn, attn_weights
-
-        # training enabled for n x n masking
-        else:
-            attn_weights = attn_weights_v_sin + attn_weights_v_cos
            
-            #print(f"Quick check on some sizing. q {q.shape}, k {k.shape}, v {v.shape}, attn_weights {attn_weights.shape}") 
-            if attn_mask is not None:
-                attn_mask_bool = attn_mask.to(torch.bool)
-                attn_weights = attn_weights.masked_fill(attn_mask_bool, 0)
-            
-            #print(f"Before resizing: {attn_weights.shape}")
-            #attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
-            #attn_weights = attn_weights.transpose(0, 2)
-            #print(f"Before key_padding mask: {attn_weights.shape}")
-            #if key_padding_mask is not None:
-            #    attn_weights = attn_weights.masked_fill(key_padding_mask, 0)
-            #print(f"After key_padding mask: {attn_weights.shape}")
-            #attn_weights = attn_weights.contiguous().view(bsz * self.num_heads, tgt_len, src_len)
-            #print(f"After key_padding mask and view: {attn_weights.shape}")
-            
             attn_weights = torch.bmm(attn_weights, v)
 
             attn_probs = self.dropout_module(attn_weights)
@@ -779,21 +483,12 @@ class MultiheadAttention(nn.Module):
                 norm_stretch_factor = 1
 
             # section to try and replicate casual relationship in normalization
-            #norm_sin = torch.cumsum(k_sin.unsqueeze(-1), dim=1).squeeze(-1).transpose(1, 2)
-            #norm_cos = torch.cumsum(k_cos.unsqueeze(-1), dim=1).squeeze(-1).transpose(1, 2)
-            #print(f"Quick check for shapes: norm_sin {norm_sin.shape}, q_sin {q_sin.shape}")
-
+            
             prob_norm_sin = torch.bmm(q_sin, norm_stretch_factor * norm_sin)
             prob_norm_cos = torch.bmm(q_cos, norm_stretch_factor * norm_cos)
             prob_norm = prob_norm_sin + prob_norm_cos
 
-            #print(f"Prob norm: {prob_norm.shape}")
-
             prob_norm = torch.diagonal(prob_norm, dim1=1, dim2=2).unsqueeze(-1)
-            
-            #print(f"Prob norm after diag: {prob_norm.shape}")
-
-            #print(f"Attn weights: {attn_weights.shape}")
             
             #prob_norm.expand(list(prob_norm.shape)[0], list(prob_norm.shape)[1], list(attn_weights.shape)[2])
             prob_norm = torch.clamp_min(prob_norm, 0.1)
@@ -804,16 +499,15 @@ class MultiheadAttention(nn.Module):
             #denom = torch.clamp_min(norm_stretch_factor * attn_weights_float.sum(dim=-1, keepdim=True), 0.1)
             #attn_weights_float = attn_weights_float / denom
             
-            #attn_weights = attn_weights_float.type_as(attn_weights)
-
             #attn = torch.bmm(attn_probs, v)
 
-            #print(f"Quick check to ensure proper attention shape: {attn.shape}")
             attn = attn.transpose(0, 1).contiguous().view(src_len, bsz, self.embed_dim)
             attn = self.out_proj(attn)
 
             return attn, attn_weights
-
+   
+    # structured slightly differently, will go back later and make it step by step instead of grouped
+    # into training and inference
     def combin_attn_train_and_infer(
         self,
         q,
@@ -826,6 +520,7 @@ class MultiheadAttention(nn.Module):
         incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
         simul_attn_chkpts: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
         layer_idx = None,
+        is_tpue = False,
     ):
         
         assert v is not None
@@ -834,11 +529,8 @@ class MultiheadAttention(nn.Module):
         
         
         if key_padding_mask is not None:
-            #print(f"Pre unsqueeze: {key_padding_mask.shape}")
-            key_pad_mask_unsqueeze = key_padding_mask.unsqueeze(1).unsqueeze(3).to(torch.bool)
-            #print(f"Post unsqueeze shape: {key_pad_mask_unsqueeze.shape}")
-            k = k.view(bsz, self.num_heads, src_len, list(k.shape)[2])
-            #print(f"k after view: {k.shape}")
+            key_pad_mask_unsqueeze = key_padding_mask.unsqueeze(1).unsqueeze(-1).to(torch.bool)
+            k = k.view(bsz, self.num_heads, src_len, list(k.shape)[2])          
             k = k.masked_fill(key_pad_mask_unsqueeze, 0)
             k = k.view(bsz*self.num_heads, src_len, list(k.shape)[3])          
 
@@ -855,7 +547,7 @@ class MultiheadAttention(nn.Module):
 
         src_len_p = math.floor((src_len + math.floor(self.max_src_len_step_size / 10)) / self.max_src_len_step_size)
 
-        # similarity function is f(x) = 1 - (i - j)^2
+        # similarity function is f(x) = 1 - (i - j)^2 or exponential alternative
         # QK^TV*f(x) = QK^TV - Q''K^TV + 2*Q'K'^TV - QK''^TV
         # activation is still relu
         
@@ -971,13 +663,24 @@ class MultiheadAttention(nn.Module):
 
         else:
 
-            for i in range(src_len):
-                idx[i] = (i + 0.1) / ((src_len_p + 1) * self.max_src_len_step_size) 
+            if self.combin_attn_enable:
+                for i in range(src_len):
+                    idx[i] = (i + 0.1) / ((src_len_p + 1) * self.max_src_len_step_size) 
+                
+                i_tr = idx
+                i_ttr = torch.square(idx)
+                j_tr = idx
+                j_ttr = torch.square(idx)
+            
+            elif self.combin_expt_attn_enable:
+                for i in range(src_len):
+                    idx[i] = i
+                
+                i_tr = torch.exp(-1 * idx)
+                i_ttr = torch.exp(-2 * idx)
+                j_tr = torch.exp(-1 * idx)
+                j_ttr = torch.exp(-2 * idx)
 
-            i_tr = idx
-            i_ttr = torch.square(idx)
-            j_tr = idx
-            j_ttr = torch.square(idx)
             i_tr = i_tr.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
             i_ttr = i_ttr.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
             j_tr = j_tr.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
@@ -1023,272 +726,9 @@ class MultiheadAttention(nn.Module):
                     attn_mask_bool = attn_mask.to(torch.bool)
                     attn_weights = attn_weights.masked_fill(attn_mask_bool, 0)
                 
-#                attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
-#                attn_weights = attn_weights.transpose(0, 2)
-#                if key_padding_mask is not None:
-#                    attn_weights = attn_weights.masked_fill(key_padding_mask, 0)
-#                attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
-                
                 attn_weights = self.dropout_module(attn_weights)
             
                 attn_weights = torch.bmm(attn_weights, v)
-            
-            # expanding normalizing vector to 768, accounting for size
-            if self.enable_norm_stretch_factor:
-                norm_stretch_factor = (src_len_p + 1) * self.max_src_len_step_size / list(k.shape)[1]
-            else:
-                norm_stretch_factor = 1
-
-            prob_norm_f = torch.bmm(q, norm)
-            prob_norm_f = torch.diagonal(prob_norm_f, dim1=1, dim2=2).unsqueeze(-1)
-            prob_norm_f_t = torch.bmm(q_t, norm_t)
-            prob_norm_f_t = torch.diagonal(prob_norm_f_t, dim1=1, dim2=2).unsqueeze(-1)
-            prob_norm_f_qtt = torch.bmm(q_tt, norm)
-            prob_norm_f_qtt = torch.diagonal(prob_norm_f_qtt, dim1=1, dim2=2).unsqueeze(-1)
-            prob_norm_f_ktt = torch.bmm(q, norm_tt)
-            prob_norm_f_ktt = torch.diagonal(prob_norm_f_ktt, dim1=1, dim2=2).unsqueeze(-1)
-
-            prob_norm = norm_stretch_factor * (prob_norm_f - prob_norm_f_qtt + 2 * prob_norm_f_t - prob_norm_f_ktt)
-            prob_norm = torch.clamp_min(prob_norm, 0.1)
-
-            attn = attn_weights / prob_norm
-
-            #print(f"Quick check to ensure proper attention shape: {attn.shape}")
-            attn = attn.transpose(0, 1).contiguous().view(src_len, bsz, self.embed_dim)
-            attn = self.out_proj(attn)
-
-            return attn, attn_weights_sum
-   
-    
-    def combin_expt_attn_train_and_infer(
-        self,
-        q,
-        k: Optional[Tensor],
-        v: Optional[Tensor],
-        src_len = None,
-        bsz = None,
-        key_padding_mask: Optional[Tensor] = None,
-        attn_mask: Optional[Tensor] = None,
-        incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
-        simul_attn_chkpts: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
-        layer_idx = None,
-    ):
-        
-        assert v is not None
-        assert q is not None
-        assert k is not None
-        
-        if key_padding_mask is not None:
-            #print(f"Pre unsqueeze: {key_padding_mask.shape}")
-            key_pad_mask_unsqueeze = key_padding_mask.unsqueeze(1).unsqueeze(3).to(torch.bool)
-            #print(f"Post unsqueeze shape: {key_pad_mask_unsqueeze.shape}")
-            k = k.view(bsz, self.num_heads, src_len, list(k.shape)[2])
-            #print(f"k after view: {k.shape}")
-            k = k.masked_fill(key_pad_mask_unsqueeze, 0)
-            k = k.view(bsz*self.num_heads, src_len, list(k.shape)[3])          
-
-        q_t = q
-        q_tt = q
-        k_t = k
-        k_tt = k
-        idx = torch.zeros(src_len, device = k.device)
-        norm = torch.zeros(list(k.shape)[0], list(k.shape)[2], 1, device=k.device)
-        norm_t = torch.zeros(list(k.shape)[0], list(k.shape)[2], 1, device=k.device)
-        norm_tt = torch.zeros(list(k.shape)[0], list(k.shape)[2], 1, device=k.device)
-
-        tgt_len = list(q.shape)[1]
-
-        src_len_p = math.floor((src_len + math.floor(self.max_src_len_step_size / 10)) / self.max_src_len_step_size)
-
-        # similarity function is f(x) = 1 - (e^-i - e^-j)^2
-        # QK^TV*f(x) = QK^TV - Q''K^TV + 2*Q'K'^TV - QK''^TV
-        # activation is still relu
-
-        if simul_attn_chkpts is not None:
-            src_idx = incremental_state["steps"]["src"]
-            tgt_idx = incremental_state["steps"]["tgt"]
-            old_src_idx = simul_attn_chkpts["old_indices"]["src"]
-            old_tgt_idx = simul_attn_chkpts["old_indices"]["tgt"]
-            q_t = torch.mul(q, math.exp(-1 * (tgt_idx - 1)))
-            q_tt = torch.mul(q, math.exp(-2 * (tgt_idx - 1)))
-
-            k_t = simul_attn_chkpts["layers"][layer_idx]["self_attn"]["k_t"]
-            k_tt = simul_attn_chkpts["layers"][layer_idx]["self_attn"]["k_tt"]
-            norm_old = simul_attn_chkpts["layers"][layer_idx]["self_attn"]["norm"]
-            norm_t_old = simul_attn_chkpts["layers"][layer_idx]["self_attn"]["norm_t"]
-            norm_tt_old = simul_attn_chkpts["layers"][layer_idx]["self_attn"]["norm_tt"]
-            j_tr = simul_attn_chkpts["layers"][layer_idx]["self_attn"]["j_tr"]
-            j_ttr = simul_attn_chkpts["layers"][layer_idx]["self_attn"]["j_ttr"]
-
-            # build key transforms if necessary
-            if k_t_old is not None and k_tt_old is not None:
-                assert k_t_old.shape == k_tt_old.shape
-                old_tgt = list(k_t_old.shape)[1]
-                if old_tgt == tgt_idx:
-                    k_t = k_t_old
-                    k_tt = k_tt_old
-                else:
-                    j_tr = j_tr[old_tgt:tgt_idx].unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-                    j_ttr = j_ttr[old_tgt:tgt_idx].unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-                    k_t = torch.cat((k_t_old, torch.matmul(k_t[:, old_tgt:, :].unsqueeze(-1), j_tr).squeeze(-1)), dim=1)
-                    k_tt = torch.cat((k_tt_old, torch.matmul(k_tt[:, old_tgt:, :].unsqueeze(-1), j_ttr).squeeze(-1)), dim=1)
-            else:
-                j_tr = j_tr[:tgt_idx].unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-                j_ttr = j_ttr[:tgt_idx].unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-                k_t = torch.matmul(k_t.unsqueeze(-1), j_tr).squeeze(-1)
-                k_tt = torch.matmul(k_tt.unsqueeze(-1), j_ttr).squeeze(-1)
-
-            # build normalization vectors if necessary
-            if norm_old is not None and norm_t_old is not None and norm_tt_old is not None:
-                assert norm_old.shape == norm_t_old.shape
-                assert norm_old.shape == norm_tt_old.shape
-                if old_tgt == tgt_idx:
-                    norm = norm_old
-                    norm_t = norm_t_old
-                    norm_tt = norm_tt_old
-                else:
-                    norm = norm + torch.sum(k.unsqueeze(-1)[:, old_tgt:, :], dim=1)
-                    norm_t = norm_t_old + torch.sum(k_t.unsqueeze(-1)[:, old_tgt:, :], dim=1)
-                    norm_tt = norm_tt_old + torch.sum(k_tt.unsqueeze(-1)[:, old_tgt:, :], dim=1)
-            else:
-                norm = torch.sum(k.unsqueeze(-1), dim=1)
-                norm_t = torch.sum(k_t.unsqueeze(-1), dim=1)
-                norm_tt = torch.sum(k_tt.unsqueeze(-1), dim=1)
-            
-
-            # build out d x d intermediate matrix
-            old_attn_weights = simul_attn_chkpts["layers"][layer_idx]["self_attn"]["attn_weights"]
-            old_attn_weights_kt = simul_attn_chkpts["layers"][layer_idx]["self_attn"]["attn_weights_kt"]
-            old_attn_weights_ktt = simul_attn_chkpts["layers"][layer_idx]["self_attn"]["attn_weights_ktt"]
-
-            if old_attn_weights is not None and old_attn_weights_kt is not None and old_attn_weights_ktt is not None:
-                assert old_attn_weights.shape == old_attn_weights_kt.shape
-                assert old_attn_weights.shape == old_attn_weights_ktt.shape
-
-                if old_tgt == tgt_idx:
-                    attn_weights = old_attn_weights
-                    attn_weights_kt = old_attn_weights_kt
-                    attn_weights_ktt = old_attn_weights_ktt
-                else:
-                    attn_weights = old_attn_weights + torch.bmm(k[:, old_tgt:, :].transpose(1, 2), v[:, old_tgt:, :])
-                    attn_weights_kt = old_attn_weights_kt + torch.bmm(k_t[:, old_tgt:, :].transpose(1, 2), v[:, old_tgt:, :])
-                    attn_weights_ktt = old_attn_weights_ktt + torch.bmm(k_tt[:, old_tgt:, :].transpose(1, 2), v[:, old_tgt:, :])
-            else:
-                attn_weights_ = torch.bmm(k.transpose(1, 2), v)
-                attn_weights_kt = torch.bmm(k_t.transpose(1, 2), v)
-                attn_weights_ktt = torch.bmm(k_tt.transpose(1, 2), v)
-            
-            attn_weights_f = torch.bmm(q, attn_weights)
-            attn_weights_f_t = torch.bmm(q_t, attn_weights_kt)
-            attn_weights_f_qtt = torch.bmm(q_tt, attn_weights)
-            attn_weights_f_ktt = torch.bmm(q, attn_weights_ktt)
-            attn_weights_f_sum = attn_weights_f - attn_weights_f_qtt + 2 * attn_weights_f_t - attn_weights
-
-            # expanding normalizing vector to 768, accounting for size
-            if self.enable_norm_stretch_factor:
-                norm_stretch_factor = (src_len_p + 1) * self.max_src_len_step_size /list(k.shape)[1]
-            else:
-                norm_stretch_factor = 1
-
-            prob_norm_f = torch.bmm(q, norm)
-            prob_norm_f_t = torch.bmm(q_t, norm_t)
-            prob_norm_f_qtt = torch.bmm(q_tt, norm)
-            prob_norm_f_ktt = torch.bmm(q, norm_tt)
-
-            prob_norm = norm_stretch_factor * (prob_norm_f - prob_norm_f_qtt + 2 * prob_norm_f_t - prob_norm_f_ktt)
-            prob_norm = torch.clamp_min(prob_norm, 0.1)
-
-            attn = attn_weights_f_sum / prob_norm
-            
-            attn = attn.transpose(0, 1).contiguous().view(src_len, bsz, self.embed_dim)
-            attn = self.out_proj(attn)
-
-            simul_attn_chkpts["layers"][layer_idx]["self_attn"]["k_t"] = k_t
-            simul_attn_chkpts["layers"][layer_idx]["self_attn"]["k_tt"] = k_tt
-            simul_attn_chkpts["layers"][layer_idx]["self_attn"]["norm"] = norm
-            simul_attn_chkpts["layers"][layer_idx]["self_attn"]["norm_t"] = norm_t
-            simul_attn_chkpts["layers"][layer_idx]["self_attn"]["norm_tt"] = norm_tt
-            simul_attn_chkpts["layers"][layer_idx]["self_attn"]["attn_weights"] = attn_weights
-            simul_attn_chkpts["layers"][layer_idx]["self_attn"]["attn_weights_kt"] = attn_weights_kt
-            simul_attn_chkpts["layers"][layer_idx]["self_attn"]["attn_weights_ktt"] = attn_weights_ktt
-
-            return attn, attn_weights_f_sum
-        
-        else:
-            for i in range(src_len):
-                idx[i] = i
-
-            i_tr = torch.exp(-1 * idx)
-            i_ttr = torch.exp(-2 * idx)
-            j_tr = torch.exp(-1 * idx)
-            j_ttr = torch.exp(-2 * idx)
-            i_tr = i_tr.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-            i_ttr = i_ttr.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-            j_tr = j_tr.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-            j_ttr = j_ttr.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-            
-            if incremental_state is not None:
-                q_t = torch.matmul(q_t.unsqueeze(-1), i_tr[:, src_len - 1, :, :]).squeeze(-1)
-                q_tt = torch.matmul(q_tt.unsqueeze(-1), i_ttr[:, src_len - 1, :, :]).squeeze(-1)
-            else:
-                q_t = torch.matmul(q_t.unsqueeze(-1), i_tr).squeeze(-1)
-                q_tt = torch.matmul(q_tt.unsqueeze(-1), i_ttr).squeeze(-1)
-            
-            k_t = torch.matmul(k_t.unsqueeze(-1), j_tr).squeeze(-1)
-            k_tt = torch.matmul(k_tt.unsqueeze(-1), j_ttr).squeeze(-1)
-            norm = torch.cumsum(k, dim=1).transpose(1, 2)
-            norm_t = torch.cumsum(k_t, dim=1).transpose(1, 2)
-            norm_tt = torch.cumsum(k_tt, dim=1).transpose(1, 2)
-
-            # linearized during training, incompatible with decoder n x n masks
-            #attn_weights_kv = torch.bmm(k.transpose(1, 2), v)
-            #attn_weights_ktv = torch.bmm(k_t.transpose(1, 2), v)
-            #attn_weights_kttv = torch.bmm(k_tt.transpose(1, 2), v)
-            
-            #attn_weights = torch.bmm(q, attn_weights_kv)
-            #attn_weights_t = torch.bmm(q_t, attn_weights_ktv)
-            #attn_weights_qtt = torch.bmm(q_tt, attn_weights_kv)
-            #attn_weights_ktt = torch.bmm(q, attn_weights_kttv)
-            #attn_weights_sum = attn_weights - attn_weights_qtt + 2*attn_weights_t - attn_weights_ktt
-
-
-            # non-linearized during training, compatible with attn mask
-            if incremental_state is not None:
-                attn_weights = torch.bmm(k.transpose(1, 2), v)
-                attn_weights_qtt = torch.bmm(k.transpose(1, 2), v)
-                attn_weights_t = torch.bmm(k_t.transpose(1, 2), v)
-                attn_weights_ktt = torch.bmm(k_tt.transpose(1, 2), v)
-
-                attn_weights = torch.bmm(q, attn_weights)
-                attn_weights_qtt = torch.bmm(q_tt, attn_weights_qtt)
-                attn_weights_qtt = torch.bmm(q_t, attn_weights_t)
-                attn_weights_ktt = torch.bmm(q, attn_weights_ktt)
-
-                attn_weights_sum = attn_weights - attn_weights_qtt + 2*attn_weights_t - attn_weights_ktt
-                attn_weights = attn_weights_sum
-
-            else:
-                attn_weights = torch.bmm(q, k.transpose(1, 2))
-                attn_weights_qtt = torch.bmm(q_tt, k.transpose(1, 2))
-                attn_weights_t = torch.bmm(q_t, k_t.transpose(1, 2))
-                attn_weights_ktt = torch.bmm(q, k_tt.transpose(1, 2))
-                attn_weights_sum = attn_weights - attn_weights_qtt + 2*attn_weights_t - attn_weights_ktt
-                
-                attn_weights = attn_weights_sum
-                if attn_mask is not None:
-                    attn_mask_bool = attn_mask.to(torch.bool)
-                    attn_weights = attn_weights.masked_fill(attn_mask_bool, 0)
-                
-#                attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
-#                attn_weights = attn_weights.transpose(0, 2)
-#                if key_padding_mask is not None:
-#                    attn_weights = attn_weights.masked_fill(key_padding_mask, 0)
-#                attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
-                
-                attn_weights = self.dropout_module(attn_weights)
-            
-                attn_weights = torch.bmm(attn_weights, v)
-            
             
             # expanding normalizing vector to 768, accounting for size
             if self.enable_norm_stretch_factor:
@@ -1314,7 +754,7 @@ class MultiheadAttention(nn.Module):
             attn = self.out_proj(attn)
 
             return attn, attn_weights_sum
-
+   
     def forward(
         self,
         query,
@@ -1367,7 +807,6 @@ class MultiheadAttention(nn.Module):
                 assert value is not None
                 assert src_len, bsz == value.shape[:2]
 
-        #print("Very first check to figure things out")
         
         if (
             not self.onnx_trace
@@ -1422,11 +861,6 @@ class MultiheadAttention(nn.Module):
                     key = value = None
         else:
             saved_state = None
-
-        #if self.linear_simul_attn_chkpts:
-        #    q = q[-1, :, :]
-        #    k = k[-1, :, :]
-        #    v = v[-1, :, :]
 
         if self.self_attention:
             q = self.q_proj(query)
@@ -1561,17 +995,11 @@ class MultiheadAttention(nn.Module):
                     dim=1,
                 )
 
-        #print("Made it to here")
-        # VA, rough cosFormer implementation, TODO: add masking capability
-        if self.cosformer_attn_enable and self.self_attention:
-            #print("cos here")
-            return self.cosformer_attn_train_and_infer(q, k, v, src_len, bsz, key_padding_mask, attn_mask, incremental_state, simul_attn_chkpts, layer_idx)
-        elif self.combin_attn_enable and self.self_attention:
-            #print("combin here")
-            return self.combin_attn_train_and_infer(q, k, v, src_len, bsz, key_padding_mask, attn_mask, incremental_state, simul_attn_chkpts, layer_idx)
-        elif self.combin_expt_attn_enable and self.self_attention:
-            #print("combin expt here")
-            return self.combin_expt_attn_train_and_infer(q, k, v, src_len, bsz, key_padding_mask, attn_mask, incremental_state, simul_attn_chkpts, layer_idx)           
+        # cosFormer implementation alongside some alternative decomposable similarity functions 
+        if self.cosformer_attn_enable or self.cosformer_expt_attn_enable and self.self_attention:
+            return self.cosformer_attn_train_and_infer(q, k, v, src_len, bsz, key_padding_mask, attn_mask, incremental_state, simul_attn_chkpts, layer_idx, is_tpu)
+        elif self.combin_attn_enable or self.combin_expt_attn_enable and self.self_attention:
+            return self.combin_attn_train_and_infer(q, k, v, src_len, bsz, key_padding_mask, attn_mask, incremental_state, simul_attn_chkpts, layer_idx, is_tpu)
 
         else:
             attn_weights = torch.bmm(q, k.transpose(1, 2))
