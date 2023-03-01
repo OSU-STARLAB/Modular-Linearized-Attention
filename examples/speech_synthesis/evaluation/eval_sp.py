@@ -31,8 +31,6 @@ def load_eval_spec(path):
 def eval_distortion(samples, distortion_fn, device="cuda"):
     nmiss = 0
     results = []
-    print(samples)
-    print(samples[0]["ref"])
     for sample in tqdm.tqdm(samples):
         if not op.isfile(sample["ref"]) or not op.isfile(sample["syn"]):
             nmiss += 1

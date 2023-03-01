@@ -144,14 +144,15 @@ class TransformerEncoderLayerBase(nn.Module):
             self_attention=True,
             q_noise=self.quant_noise,
             qn_block_size=self.quant_noise_block_size,
-            simple_attention=cfg.simple_attention,
-            #cosformer_attn_enable=cfg.cosformer_attn_enable,
+            simple_attention=cfg.enc_simple_attn_enable,
+            cosformer_attn_enable=cfg.enc_cosformer_attn_enable,
             cosformer_expt_attn_enable=cfg.cosformer_expt_attn_enable,
             combin_attn_enable=cfg.combin_attn_enable,
             combin_expt_attn_enable=cfg.combin_expt_attn_enable,
             enable_norm_stretch_factor=(not cfg.disable_norm_stretch_factor),
             max_src_len_step_size=128,
             #shortened_expt_simil=cfg.shortened_expt_simil,
+            #cosformer_attn_enable=cfg.cosformer_attn_enable,
         )
 
     def residual_connection(self, x, residual):
@@ -175,6 +176,7 @@ class TransformerEncoderLayerBase(nn.Module):
         self,
         x,
         encoder_padding_mask: Optional[Tensor],
+        src_lengths = None,
         attn_mask: Optional[Tensor] = None,
     ):
         """
@@ -212,6 +214,8 @@ class TransformerEncoderLayerBase(nn.Module):
             key_padding_mask=encoder_padding_mask,
             need_weights=False,
             attn_mask=attn_mask,
+            src_lengths=src_lengths,
+            tgt_lengths=src_lengths,
         )
         #print(f"Encoder self-attn shape: {x.shape}")
         x = self.dropout_module(x)
@@ -374,14 +378,16 @@ class TransformerDecoderLayerBase(nn.Module):
             self_attention=not cfg.cross_self_attention,
             q_noise=self.quant_noise,
             qn_block_size=self.quant_noise_block_size,
-            simple_attention=cfg.simple_attention,
-            cosformer_attn_enable=cfg.cosformer_attn_enable,
+            simple_attention=cfg.dec_simple_attn_enable,
+            cosformer_attn_enable=(cfg.dec_cosformer_attn_enable or cfg.cosformer_attn_enable),
+            expt_simil=cfg.dec_expt_simil,
             cosformer_expt_attn_enable=cfg.cosformer_expt_attn_enable,
             combin_attn_enable=cfg.combin_attn_enable,
             combin_expt_attn_enable=cfg.combin_expt_attn_enable,
             enable_norm_stretch_factor=(not cfg.disable_norm_stretch_factor),
             max_src_len_step_size=cfg.max_src_len_step_size,
             shortened_expt_simil=cfg.shortened_expt_simil,
+            #cosformer_attn_enable=cfg.cosformer_attn_enable,
         )
 
     def build_encoder_attention(self, embed_dim, cfg):
@@ -394,7 +400,8 @@ class TransformerDecoderLayerBase(nn.Module):
             encoder_decoder_attention=True,
             q_noise=self.quant_noise,
             qn_block_size=self.quant_noise_block_size,
-            #simple_attention=cfg.simple_attention,
+            cosformer_attn_enable=cfg.dec_cross_cosformer_attn_enable,
+            simple_attention=cfg.dec_cross_simple_attn_enable,
             #cosformer_attn_enable=cfg.cosformer_attn_enable,
         )
 
@@ -410,12 +417,19 @@ class TransformerDecoderLayerBase(nn.Module):
         encoder_out: Optional[torch.Tensor] = None,
         encoder_padding_mask: Optional[torch.Tensor] = None,
         incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
+        simul_attn_chkpts: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
         prev_self_attn_state: Optional[List[torch.Tensor]] = None,
         prev_attn_state: Optional[List[torch.Tensor]] = None,
         self_attn_mask: Optional[torch.Tensor] = None,
         self_attn_padding_mask: Optional[torch.Tensor] = None,
         need_attn: bool = False,
         need_head_weights: bool = False,
+        out_length_pred: Optional[torch.Tensor] = None,
+        out_length_lut_pred: Optional[torch.Tensor] = None,
+        oracle_length_train = False,
+        layer_idx = None,
+        src_lengths = None,
+        tgt_lengths = None,
     ):
         """
         Args:
@@ -430,6 +444,7 @@ class TransformerDecoderLayerBase(nn.Module):
         Returns:
             encoded output of shape `(seq_len, batch, embed_dim)`
         """
+       
         if need_head_weights:
             need_attn = True
 
@@ -476,8 +491,15 @@ class TransformerDecoderLayerBase(nn.Module):
             value=y,
             key_padding_mask=self_attn_padding_mask,
             incremental_state=incremental_state,
+            simul_attn_chkpts=simul_attn_chkpts,
+            layer_idx=layer_idx,
             need_weights=False,
             attn_mask=self_attn_mask,
+            out_length_pred=out_length_pred,
+            out_length_lut_pred=out_length_lut_pred,
+            oracle_length_train=oracle_length_train,
+            src_lengths=tgt_lengths,
+            tgt_lengths=tgt_lengths,
         )
         #print(f"Decoder self-attn shape: {x.shape}")
         if self.c_attn is not None:
@@ -513,9 +535,16 @@ class TransformerDecoderLayerBase(nn.Module):
                 value=encoder_out,
                 key_padding_mask=encoder_padding_mask,
                 incremental_state=incremental_state,
+                simul_attn_chkpts=simul_attn_chkpts,
+                layer_idx=layer_idx,
                 static_kv=True,
                 need_weights=need_attn or (not self.training and self.need_attn),
                 need_head_weights=need_head_weights,
+                out_length_pred=out_length_pred,
+                out_length_lut_pred=out_length_lut_pred,
+                oracle_length_train=oracle_length_train,
+                src_lengths=src_lengths,
+                tgt_lengths=tgt_lengths,
             )
             x = self.dropout_module(x)
             #print(f"Attn output shape: {x.shape}")

@@ -110,6 +110,9 @@ class Tacotron2Criterion(FairseqCriterion):
         src_tokens = sample["net_input"]["src_tokens"]
         src_lens = sample["net_input"]["src_lengths"]
         tgt_lens = sample["target_lengths"]
+        
+        src_mask = lengths_to_mask(src_lens)
+        #tgt_mask = lengths_to_mask(tgt_lens)
 
         feat_out, eos_out, extra = model(
             src_tokens=src_tokens,
@@ -119,7 +122,7 @@ class Tacotron2Criterion(FairseqCriterion):
             target_lengths=tgt_lens,
             speaker=sample["speaker"],
         )
-
+        
         l1_loss, mse_loss, eos_loss = self.compute_loss(
             extra["feature_out"],
             feat_out,
@@ -129,6 +132,21 @@ class Tacotron2Criterion(FairseqCriterion):
             tgt_lens,
             reduction,
         )
+     
+        dur_loss = torch.tensor(0.0).type_as(l1_loss)
+        mse_dur_loss = torch.tensor(0.0).type_as(l1_loss)
+        if extra["out_length_pred"] is not None:
+            log_dur_out = extra["log_dur_out"][src_mask]
+            dur = sample["durations"].float()
+            dur = dur.half() if log_dur_out.type().endswith(".HalfTensor") else dur
+            log_dur = torch.log(dur + 1)[src_mask]
+            
+            dur_loss = F.l1_loss(log_dur_out, log_dur, reduction=reduction)
+            mse_dur_loss = F.mse_loss(log_dur_out, log_dur, reduction=reduction)
+            #print(dur_loss, mse_dur_loss, l1_loss, mse_loss)
+            l1_loss += dur_loss
+            mse_loss += mse_dur_loss
+
         attn_loss = torch.tensor(0.0).type_as(l1_loss)
         if self.guided_attn is not None:
             attn_loss = self.guided_attn(extra["attn"], src_lens, tgt_lens, reduction)
@@ -160,6 +178,8 @@ class Tacotron2Criterion(FairseqCriterion):
             "sample_size": sample_size,
             "l1_loss": utils.item(l1_loss.data),
             "mse_loss": utils.item(mse_loss.data),
+            "tgt_dur_loss": utils.item(dur_loss.data),
+            "mse_tgt_dur_loss": utils.item(mse_dur_loss.data),
             "eos_loss": utils.item(eos_loss.data),
             "attn_loss": utils.item(attn_loss.data),
             "ctc_loss": utils.item(ctc_loss.data),
@@ -202,7 +222,7 @@ class Tacotron2Criterion(FairseqCriterion):
         ns = [log.get("sample_size", 0) for log in logging_outputs]
         ntot = sum(ns)
         ws = [n / (ntot + 1e-8) for n in ns]
-        for key in ["loss", "l1_loss", "mse_loss", "eos_loss", "attn_loss", "ctc_loss"]:
+        for key in ["loss", "l1_loss", "mse_loss", "eos_loss", "attn_loss", "ctc_loss", "tgt_dur_loss", "mse_tgt_dur_loss"]:
             vals = [log.get(key, 0) for log in logging_outputs]
             val = sum(val * w for val, w in zip(vals, ws))
             metrics.log_scalar(key, val, ntot, round=3)

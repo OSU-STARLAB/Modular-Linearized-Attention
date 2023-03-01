@@ -18,6 +18,7 @@ from fairseq.logging import progress_bar
 from fairseq.tasks.text_to_speech import plot_tts_output
 from fairseq.data.audio.text_to_speech_dataset import TextToSpeechDataset
 
+import cProfile
 
 logging.basicConfig()
 logging.root.setLevel(logging.INFO)
@@ -90,7 +91,8 @@ def dump_result(
     if args.dump_attentions:
         attn_dir = out_root / "attn"
         attn_dir.mkdir(exist_ok=True, parents=True)
-        np.save(attn_dir / f"{sample_id}.npy", attn.numpy())
+        #np.save(attn_dir / f"{sample_id}.npy", attn.numpy())
+        np.save(attn_dir / f"{sample_id}.npy", attn)
     if args.dump_eos_probs and not is_na_model:
         eos_dir = out_root / "eos"
         eos_dir.mkdir(exist_ok=True, parents=True)
@@ -171,22 +173,107 @@ def main(args):
     Path(args.results_path).mkdir(exist_ok=True, parents=True)
     is_na_model = getattr(model, "NON_AUTOREGRESSIVE", False)
     dataset = task.dataset(args.gen_subset)
+    #print(dataset, flush=True)
     vocoder = task.args.vocoder
+    logger.info(f"Inference on test set is beginning.")
     with progress_bar.build_progress_bar(args, itr) as t:
         for sample in t:
+            # manual information for processed tokens, a better solution should be used later
+            lut_pho = {
+                "W" : 6.3,
+                "AY1" : 13.52,
+                "L" : 7.97,
+                "spn" : 47.84,
+                "F" : 9.7,
+                "R" : 6.61,
+                "AH0" : 5.24,
+                "Z" : 9.74,
+                "D" : 6.0,
+                "IH1" : 6.44,
+                "JH" : 8.99,
+                "N" : 5.94,
+                "T" : 7.6,
+                "IY0" : 9.09,
+                "EH0" : 6.79,
+                "G" : 6.92,
+                "EY1" : 12.47,
+                "P" : 7.94,
+                "AA1" : 10.07,
+                "HH" : 7.16,
+                "ER0" : 9.18,
+                "S" : 10.66,
+                "EH1" : 7.88,
+                "IH0" : 5.31,
+                "M" : 6.9,
+                "OW1" : 11.61,
+                "AE1" : 9.76,
+                "K" : 8.37,
+                "UW1" : 9.71,
+                "EY0" : 11.87,
+                "AH1" : 6.04,
+                "DH" : 3.99,
+                "ER1" : 11.13,
+                "IY1" : 10.76,
+                "sp" : 15.01,
+                "AW1" : 14.96,
+                "B" : 5.53,
+                "AE0" : 6.73,
+                "V" : 6.26,
+                "AH2" : 6.73,
+                "UH1" : 5.9,
+                "AO1" : 10.8,
+                "Y" : 7.08,
+                "UW0" : 6.86,
+                "NG" : 8.51,
+                "AW2" : 11.33,
+                "IH2" : 5.53,
+                "SH" : 10.39,
+                "TH" : 9.72,
+                "CH" : 10.08,
+                "OW0" : 9.06,
+                "ZH" : 8.32,
+                "EH2" : 6.11,
+                "EY2" : 9.83,
+                "AY0" : 9.3,
+                "AY2" : 13.84,
+                "OW2" : 8.84,
+                "AO2" : 7.15,
+                "IY2" : 7.83,
+                "OY1" : 14.51,
+                "AE2" : 10.21,
+                "AO0" : 6.27,
+                "UH2" : 5.95,
+                "AA2" : 8.56,
+                "AA0" : 7.07,
+                "UW2" : 7.15,
+                "UH0" : 3.06,
+                "ER2" : 7.18,
+                "AW0" : 15.29,
+                "OY2" : 15.93,
+                "OY0" : 19.25,
+            }
+
+            lut = {}
+            for key in lut_pho:
+                lut[task.src_dict.index(key)] = lut_pho[key]
+
+            #print(lut)
+
+            # hard code lut for now, add a switch later
             sample = utils.move_to_cuda(sample) if use_cuda else sample
-            hypos = generator.generate(model, sample, has_targ=args.dump_target)
+            #cProfile.runctx('generator.generate(model, sample, has_targ=args.dump_target, lut=lut)', globals(), locals(), 'restats')
+            hypos = generator.generate(model, sample, has_targ=args.dump_target, lut=lut)
             for result in postprocess_results(
                     dataset, sample, hypos, resample_fn, args.dump_target
             ):
                 dump_result(is_na_model, args, vocoder, *result)
-
+    
+    logger.info(f"Inference is finished.")
 
 def cli_main():
     parser = make_parser()
     args = options.parse_args_and_arch(parser)
     main(args)
-
 
 if __name__ == "__main__":
     cli_main()

@@ -47,7 +47,7 @@ class AutoRegressiveSpeechGenerator(SpeechGenerator):
         self.eos_prob_threshold = eos_prob_threshold
 
     @torch.no_grad()
-    def generate(self, model, sample, has_targ=False, **kwargs):
+    def generate(self, model, sample, lut=None, has_targ=False, **kwargs):
         model.eval()
 
         src_tokens = sample["net_input"]["src_tokens"]
@@ -59,21 +59,31 @@ class AutoRegressiveSpeechGenerator(SpeechGenerator):
 
         # initialize
         encoder_out = model.forward_encoder(
-            src_tokens, src_lengths, speaker=sample["speaker"]
+            src_tokens, src_lengths, speaker=sample["speaker"], lut=lut,
         )
         incremental_state = {}
+        simul_attn_chkpts = {}
         feat, attn, eos_prob = [], [], []
         finished = src_tokens.new_zeros((bsz,)).bool()
         out_lens = src_lengths.new_zeros((bsz,)).long().fill_(self.max_iter)
 
         prev_feat_out = encoder_out["encoder_out"][0].new_zeros(bsz, 1, out_dim)
+       
+        self.init_simul_chkpts(simul_attn_chkpts)
+        #print(simul_attn_chkpts)
+        #print(encoder_out["encoder_out"][0].size())
         for step in range(self.max_iter):
+            incremental_state["steps"] = {
+                "src": encoder_out["encoder_out"][0].size(0),
+                "tgt": 1 + step,
+            }
             cur_out_lens = out_lens.clone()
             cur_out_lens.masked_fill_(cur_out_lens.eq(self.max_iter), step + 1)
             _, cur_eos_out, cur_extra = model.forward_decoder(
                 prev_feat_out,
                 encoder_out=encoder_out,
                 incremental_state=incremental_state,
+                simul_attn_chkpts=simul_attn_chkpts,
                 target_lengths=cur_out_lens,
                 speaker=sample["speaker"],
                 **kwargs
@@ -124,6 +134,28 @@ class AutoRegressiveSpeechGenerator(SpeechGenerator):
                 finalized[b]["targ_feature"] = f[:l]
                 finalized[b]["targ_waveform"] = self.get_waveform(f[:l])
         return finalized
+
+    def init_simul_chkpts(self, simul_attn_chkpts):
+        simul_attn_chkpts["layers"] = {}
+        # hard coded for now
+        for i in range(6):
+            simul_attn_chkpts["layers"][i] = {}
+            simul_attn_chkpts["layers"][i]["self_attn"] = {}
+            simul_attn_chkpts["layers"][i]["cross_attn"] = {}
+            simul_attn_chkpts["layers"][i]["self_attn"]["norm_sin"] = None
+            simul_attn_chkpts["layers"][i]["self_attn"]["norm_cos"] = None
+            simul_attn_chkpts["layers"][i]["self_attn"]["k_sin"] = None
+            simul_attn_chkpts["layers"][i]["self_attn"]["k_cos"] = None
+            simul_attn_chkpts["layers"][i]["self_attn"]["v"] = None
+            simul_attn_chkpts["layers"][i]["self_attn"]["kTv_sin"] = None
+            simul_attn_chkpts["layers"][i]["self_attn"]["kTv_cos"] = None
+            simul_attn_chkpts["layers"][i]["cross_attn"]["norm_sin"] = None
+            simul_attn_chkpts["layers"][i]["cross_attn"]["norm_cos"] = None
+            simul_attn_chkpts["layers"][i]["cross_attn"]["k_sin"] = None
+            simul_attn_chkpts["layers"][i]["cross_attn"]["k_cos"] = None
+            simul_attn_chkpts["layers"][i]["cross_attn"]["v"] = None
+            simul_attn_chkpts["layers"][i]["cross_attn"]["kTv_sin"] = None
+            simul_attn_chkpts["layers"][i]["cross_attn"]["kTv_cos"] = None
 
 
 class NonAutoregressiveSpeechGenerator(SpeechGenerator):
@@ -229,3 +261,6 @@ class TeacherForcingAutoRegressiveSpeechGenerator(AutoRegressiveSpeechGenerator)
                 finalized[b]["targ_feature"] = f[:l]
                 finalized[b]["targ_waveform"] = self.get_waveform(f[:l])
         return finalized
+
+
+

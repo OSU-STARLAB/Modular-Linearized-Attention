@@ -28,8 +28,12 @@ from fairseq.modules import (
     TransformerEncoderLayer,
 )
 
-logger = logging.getLogger(__name__)
+from fairseq.models.text_to_speech.fastspeech2 import (
+    LengthRegulator,
+    VariancePredictor,
+)
 
+logger = logging.getLogger(__name__)
 
 def encoder_init(m):
     if isinstance(m, nn.Conv1d):
@@ -59,6 +63,16 @@ class TTSTransformerEncoder(FairseqEncoder):
         self.embed_tokens = nn.Embedding(
             len(src_dict), args.encoder_embed_dim, padding_idx=self.padding_idx
         )
+        
+        self.length_pred = getattr(args, "length_pred", False)
+        
+        # deprecate this if-statement
+        #if self.length_pred:
+        #    self.length_regulator = LengthRegulator()
+        #    self.duration_predictor = VariancePredictor(args)
+        self.length_regulator = LengthRegulator()
+        self.duration_predictor = VariancePredictor(args)
+        
         assert args.encoder_conv_kernel_size % 2 == 1
         self.prenet = nn.ModuleList(
             nn.Sequential(
@@ -91,7 +105,22 @@ class TTSTransformerEncoder(FairseqEncoder):
 
         self.apply(encoder_init)
 
-    def forward(self, src_tokens, src_lengths=None, speaker=None, **kwargs):
+    def forward(self, src_tokens, src_lengths=None, speaker=None, lut=None, **kwargs):
+        out_length_lut_pred = None
+        if lut is not None:
+            out_length_lut_pred = torch.zeros(src_tokens.size(0))
+            for i in range(src_tokens.size(0)):
+                for j in range(src_lengths[i]):
+                    if src_tokens[i, j].item() in lut:
+                        out_length_lut_pred[i] += lut[src_tokens[i, j].item()]
+                out_length_lut_pred[i] = out_length_lut_pred[i] // 4
+
+        # necessary for now, can be changed later
+        src_lengths_extend = None
+        if src_lengths is not None:
+            src_lengths_extend = src_lengths.repeat_interleave(8)
+            #src_lengths_extend = src_lengths.repeat_interleave(self.args.decoder_attention_heads)
+
         x = self.embed_tokens(src_tokens)
         x = x.transpose(1, 2).contiguous()  # B x T x C -> B x C x T
         for conv in self.prenet:
@@ -108,7 +137,7 @@ class TTSTransformerEncoder(FairseqEncoder):
         x = x.transpose(0, 1)
 
         for layer in self.transformer_layers:
-            x = layer(x, padding_mask)
+            x = layer(x, padding_mask, src_lengths_extend)
 
         if self.layer_norm is not None:
             x = self.layer_norm(x)
@@ -118,6 +147,29 @@ class TTSTransformerEncoder(FairseqEncoder):
             emb = self.embed_speaker(speaker).transpose(0, 1)
             emb = emb.expand(seq_len, bsz, -1)
             x = self.spk_emb_proj(torch.cat([x, emb], dim=2))
+       
+        out_lens = None
+        log_dur_out = None
+        if self.length_pred:
+            # x: B x T x C
+            x_temp = x.transpose(0, 1)
+            log_dur_out = self.duration_predictor(x_temp)
+            dur_out = torch.clamp(
+                # d_factor commonly set to 1.0, but this can be tweaked later
+                #torch.round((torch.exp(log_dur_out) - 1) * d_factor).long(), min=0
+                torch.round(torch.exp(log_dur_out) - 1).long(), min=0
+            )
+            dur_out.masked_fill_(padding_mask, 0)
+            out_lens = dur_out 
+            #x, out_lens = self.length_regulator(
+            _, out_lens = self.length_regulator(
+                x_temp, dur_out
+            )
+            out_lens = torch.floor_divide(out_lens, 4)
+            out_lens = torch.clamp(out_lens, min=1, max=1000)
+            #print(x.shape)
+            #print(out_lens.shape)
+            #print(out_lens)
 
         return {
             "encoder_out": [x],  # T x B x C
@@ -127,7 +179,10 @@ class TTSTransformerEncoder(FairseqEncoder):
             "encoder_embedding": [],  # B x T x C
             "encoder_states": [],  # List[T x B x C]
             "src_tokens": [],
-            "src_lengths": [],
+            "src_lengths": src_lengths_extend,
+            "out_length_pred": out_lens,
+            "out_length_lut_pred": out_length_lut_pred,
+            "log_dur_out": log_dur_out,
         }
 
 
@@ -160,6 +215,10 @@ class TTSTransformerDecoder(FairseqIncrementalDecoder):
             nn.Linear(args.prenet_dim, args.decoder_embed_dim),
         )
 
+        # length prediction toggle
+        self.length_pred = getattr(args, "length_pred", False)
+        self.oracle_length_train = getattr(args, "oracle_length_train", False)
+
         self.n_transformer_layers = args.decoder_transformer_layers
         self.transformer_layers = nn.ModuleList(
             TransformerDecoderLayer(args) for _ in range(self.n_transformer_layers)
@@ -191,32 +250,58 @@ class TTSTransformerDecoder(FairseqIncrementalDecoder):
         prev_outputs,
         encoder_out=None,
         incremental_state=None,
+        simul_attn_chkpts=None,
         target_lengths=None,
         speaker=None,
+        out_length_pred=None,
+        out_length_lut_pred=None,
+        tgt_lengths=None,
         **kwargs,
     ):
+        
         alignment_layer = self.n_transformer_layers - 1
         self_attn_padding_mask = lengths_to_padding_mask(target_lengths)
         positions = self.embed_positions(
             self_attn_padding_mask, incremental_state=incremental_state
         )
 
-        #print(incremental_state)
         if incremental_state is not None:
             prev_outputs = prev_outputs[:, -1:, :]
             self_attn_padding_mask = self_attn_padding_mask[:, -1:]
             if positions is not None:
                 positions = positions[:, -1:]
 
+        if out_length_pred is not None:
+            bsz = out_length_pred.size(0)
+            temp_out_length_pred = out_length_pred.repeat_interleave(self.args.decoder_attention_heads)
+            assert temp_out_length_pred.size(0) == bsz * self.args.decoder_attention_heads
+
+        if out_length_lut_pred is not None:
+            bsz = out_length_lut_pred.size(0)
+            temp_out_length_lut_pred = out_length_lut_pred.repeat_interleave(self.args.decoder_attention_heads)
+            temp_out_length_lut_pred = temp_out_length_lut_pred / 1.1
+            assert temp_out_length_lut_pred.size(0) == bsz * self.args.decoder_attention_heads
+
+        # hardcoded for now
+        tgt_lengths_extend = None
+        if tgt_lengths is not None:
+            tgt_lengths_extend = tgt_lengths.repeat_interleave(8)
+            #tgt_lengths_extend = tgt_lengths.repeat_interleave(self.args.decoder_attention_heads)
+
         x = self.prenet(prev_outputs)
         x += self.pos_emb_alpha * positions
         x = self.dropout_module(x)
+        
+        #print(x.shape)
+        #print(encoder_out["encoder_out"][0].shape)
+        #print(out_length_pred.shape)
 
         # B x T x C -> T x B x C
         x = x.transpose(0, 1)
 
         if not self_attn_padding_mask.any():
             self_attn_padding_mask = None
+
 
         attn: Optional[torch.Tensor] = None
         inner_states: List[Optional[torch.Tensor]] = [x]
@@ -226,6 +311,11 @@ class TTSTransformerDecoder(FairseqIncrementalDecoder):
             else:
                 self_attn_mask = None
 
+            #print(encoder_out["encoder_out"][0], flush=True)
+            #print(len(encoder_out["encoder_out"]), flush=True)
+
+            # hard coded removal of attn dumping
+            flag = True
             x, layer_attn, _ = transformer_layer(
                 x,
                 encoder_out["encoder_out"][0]
@@ -238,16 +328,23 @@ class TTSTransformerDecoder(FairseqIncrementalDecoder):
                 )
                 else None,
                 incremental_state,
+                simul_attn_chkpts=simul_attn_chkpts,
                 self_attn_mask=self_attn_mask,
                 self_attn_padding_mask=self_attn_padding_mask,
-                need_attn=bool((idx == alignment_layer)),
-                need_head_weights=bool((idx == alignment_layer)),
+                need_attn=(flag and bool((idx == alignment_layer))),
+                need_head_weights=(flag and bool((idx == alignment_layer))),
+                out_length_pred=temp_out_length_pred if out_length_pred is not None else None,
+                out_length_lut_pred=temp_out_length_lut_pred if out_length_lut_pred is not None else None,
+                oracle_length_train=self.oracle_length_train,
+                layer_idx=idx,
+                src_lengths=encoder_out["src_lengths"],
+                tgt_lengths=tgt_lengths_extend,
             )
             inner_states.append(x)
             if layer_attn is not None and idx == alignment_layer:
                 attn = layer_attn.float().to(x)
 
-        if attn is not None:
+        if attn is not None and flag:
             # average probabilities over heads, transpose to
             # (B, src_len, tgt_len)
             attn = attn.mean(dim=0).transpose(2, 1)
@@ -258,23 +355,35 @@ class TTSTransformerDecoder(FairseqIncrementalDecoder):
         # T x B x C -> B x T x C
         x = x.transpose(0, 1)
 
-        return x, {"attn": attn, "inner_states": inner_states}
+        return x, {"attn": attn, "inner_states": inner_states, "out_length_pred": out_length_pred}
 
     def forward(
         self,
         prev_output_tokens,
         encoder_out=None,
         incremental_state=None,
+        simul_attn_chkpts=None,
         target_lengths=None,
         speaker=None,
         **kwargs,
     ):
+
+        out_lens = None
+        if self.length_pred:
+            out_lens = encoder_out["out_length_pred"]
+
+        out_lut_lengths = encoder_out["out_length_lut_pred"]
+
         x, extra = self.extract_features(
             prev_output_tokens,
             encoder_out=encoder_out,
             incremental_state=incremental_state,
+            simul_attn_chkpts=simul_attn_chkpts,
             target_lengths=target_lengths,
             speaker=speaker,
+            out_length_pred=out_lens,
+            out_length_lut_pred=out_lut_lengths,
+            tgt_lengths=target_lengths,
             **kwargs,
         )
         attn = extra["attn"]
@@ -289,6 +398,8 @@ class TTSTransformerDecoder(FairseqIncrementalDecoder):
                 "attn": attn,
                 "feature_out": feat_out,
                 "inner_states": extra["inner_states"],
+                "out_length_pred": extra["out_length_pred"],
+                "log_dur_out": encoder_out["log_dur_out"],
             },
         )
 
@@ -396,6 +507,17 @@ class TTSTransformerModel(FairseqEncoderDecoderModel):
         parser.add_argument("--decoder-attention-heads", type=int)
         parser.add_argument("--simple-attention", action="store_true")
         parser.add_argument("--shortened-expt-simil", action="store_true")
+        #parser.add_argument("--cosformer-attn-enable", action="store_true")
+        parser.add_argument("--length-pred", action="store_true")
+        parser.add_argument("--oracle-length-train", action="store_true")
+        parser.add_argument("--enc-cosformer-attn-enable", action="store_true")
+        parser.add_argument("--dec-cosformer-attn-enable", action="store_true")
+        parser.add_argument("--dec-cross-cosformer-attn-enable", action="store_true")
+        parser.add_argument("--enc-simple-attn-enable", action="store_true")
+        parser.add_argument("--dec-simple-attn-enable", action="store_true")
+        parser.add_argument("--dec-crwss-simple-attn-enable", action="store_true")
+        parser.add_argument("--dec-expt-simil", action="store_true")
+         
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -412,7 +534,7 @@ class TTSTransformerModel(FairseqEncoderDecoderModel):
         return self.encoder(
             src_tokens, src_lengths=src_lengths, speaker=speaker, **kwargs
         )
-
+    
     def set_num_updates(self, num_updates):
         super().set_num_updates(num_updates)
         self._num_updates = num_updates
@@ -433,6 +555,13 @@ def base_architecture(args):
     args.encoder_ffn_embed_dim = getattr(
         args, "encoder_ffn_embed_dim", 4 * args.encoder_embed_dim
     )
+
+    # length prediction related content
+    #args.var_pred_n_bins = getattr(args, "var_pred_n_bins", 256)
+    args.var_pred_hidden_dim = getattr(args, "var_pred_hidden_dim", 128)
+    args.var_pred_kernel_size = getattr(args, "var_pred_kernel_size", 3)
+    args.var_pred_dropout = getattr(args, "var_pred_dropout", 0.5)
+    
     args.encoder_normalize_before = getattr(args, "encoder_normalize_before", False)
     args.encoder_attention_heads = getattr(args, "encoder_attention_heads", 4)
     args.attention_dropout = getattr(args, "attention_dropout", 0.0)

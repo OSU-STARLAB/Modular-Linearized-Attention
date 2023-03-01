@@ -238,9 +238,37 @@ class TransformerConfig(FairseqDataclass):
         default=False,
         metadata={"help": "Replace softmax with ReLU and cosine-based transform as proposed by the paper introducing cosFormer"},
     )
+    enc_cosformer_attn_enable: bool = field(
+        default=False,
+        metadata={"help": "Replace softmax with ReLU and cosine-based transform as proposed by the paper introducing cosFormer"},
+    )
+    dec_cosformer_attn_enable: bool = field(
+        default=False,
+        metadata={"help": "Replace softmax with ReLU and cosine-based transform as proposed by the paper introducing cosFormer"},
+    )
+    dec_cross_cosformer_attn_enable: bool = field(
+        default=False,
+        metadata={"help": "Replace softmax with ReLU and cosine-based transform as proposed by the paper introducing cosFormer"},
+    )
+    enc_simple_attn_enable: bool = field(
+        default=False,
+        metadata={"help": "Replace softmax with ReLU, for encoder self-attention"},
+    )
+    dec_simple_attn_enable: bool = field(
+        default=False,
+        metadata={"help": "Replace softmax with ReLU, for decoder self-attention"},
+    )
+    dec_cross_simple_attn_enable: bool = field(
+        default=False,
+        metadata={"help": "Replace softmax with ReLU, for decoder cross-attention"},
+    )
     cosformer_expt_attn_enable: bool = field(
         default=False,
         metadata={"help": "Replace softmax with ReLU and cosine-based transform as proposed by the paper introducing cosFormer. Added exponential component."},
+    )
+    dec_expt_simil: bool = field(
+        default=False,
+        metadata={"help": "Adds a small similarity function for either ReLu or softmax based implementations."},
     )
     combin_attn_enable: bool = field(
         default=False,
