@@ -17,7 +17,8 @@ import re
 import numpy as np
 import pandas as pd
 import soundfile as sf
-from examples.speech_to_text.data_utils import (
+#from examples.speech_to_text.data_utils import (
+from data_utils import (
     create_zip,
     extract_fbank_features,
     filter_manifest_df,
@@ -28,6 +29,8 @@ from examples.speech_to_text.data_utils import (
     save_df_to_tsv,
     cal_gcmvn_stats,
 )
+
+
 import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm

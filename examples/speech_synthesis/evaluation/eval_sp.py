@@ -72,24 +72,25 @@ def print_results(results, show_bin):
     np.set_printoptions(precision=3)
 
     def _print_result(results):
-        dist, dur_ref, dur_syn, dur_ali, nins, ndel = results.sum(axis=0)
-        res = {
-            "nutt": len(results),
-            "dist": dist,
-            "dur_ref": int(dur_ref),
-            "dur_syn": int(dur_syn),
-            "dur_ali": int(dur_ali),
-            "dist_per_ref_frm": dist/dur_ref,
-            "dist_per_syn_frm": dist/dur_syn,
-            "dist_per_ali_frm": dist/dur_ali,
-            "ins": nins/dur_ref,
-            "del": ndel/dur_ref,
-        }
-        print(tabulate(
-            [res.values()],
-            res.keys(),
-            floatfmt=".4f"
-        ))
+        if results is not None and len(results) > 0:
+            dist, dur_ref, dur_syn, dur_ali, nins, ndel = results.sum(axis=0)
+            res = {
+                "nutt": len(results),
+                "dist": dist,
+                "dur_ref": int(dur_ref),
+                "dur_syn": int(dur_syn),
+                "dur_ali": int(dur_ali),
+                "dist_per_ref_frm": dist/dur_ref,
+                "dist_per_syn_frm": dist/dur_syn,
+                "dist_per_ali_frm": dist/dur_ali,
+                "ins": nins/dur_ref,
+                "del": ndel/dur_ref,
+            }
+            print(tabulate(
+                [res.values()],
+                res.keys(),
+                floatfmt=".4f"
+            ))
 
     print(">>>> ALL")
     _print_result(results)

@@ -31,7 +31,10 @@ from fairseq.modules import (
 from fairseq.models.text_to_speech.fastspeech2 import (
     LengthRegulator,
     VariancePredictor,
+    LargeVariancePredictor,
 )
+
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -66,12 +69,8 @@ class TTSTransformerEncoder(FairseqEncoder):
         
         self.length_pred = getattr(args, "length_pred", False)
         
-        # deprecate this if-statement
-        #if self.length_pred:
-        #    self.length_regulator = LengthRegulator()
-        #    self.duration_predictor = VariancePredictor(args)
         self.length_regulator = LengthRegulator()
-        self.duration_predictor = VariancePredictor(args)
+        self.duration_predictor = LargeVariancePredictor(args)
         
         assert args.encoder_conv_kernel_size % 2 == 1
         self.prenet = nn.ModuleList(
@@ -119,7 +118,6 @@ class TTSTransformerEncoder(FairseqEncoder):
         src_lengths_extend = None
         if src_lengths is not None:
             src_lengths_extend = src_lengths.repeat_interleave(8)
-            #src_lengths_extend = src_lengths.repeat_interleave(self.args.decoder_attention_heads)
 
         x = self.embed_tokens(src_tokens)
         x = x.transpose(1, 2).contiguous()  # B x T x C -> B x C x T
@@ -127,6 +125,7 @@ class TTSTransformerEncoder(FairseqEncoder):
             x = conv(x)
         x = x.transpose(1, 2).contiguous()  # B x C x T -> B x T x C
         x = self.prenet_proj(x)
+
 
         padding_mask = src_tokens.eq(self.padding_idx)
         positions = self.embed_positions(padding_mask)
@@ -136,6 +135,8 @@ class TTSTransformerEncoder(FairseqEncoder):
         # B x T x C -> T x B x C
         x = x.transpose(0, 1)
 
+        bsz = x.size(1)
+        src_len = x.size(0)
         for layer in self.transformer_layers:
             x = layer(x, padding_mask, src_lengths_extend)
 
@@ -161,15 +162,11 @@ class TTSTransformerEncoder(FairseqEncoder):
             )
             dur_out.masked_fill_(padding_mask, 0)
             out_lens = dur_out 
-            #x, out_lens = self.length_regulator(
             _, out_lens = self.length_regulator(
                 x_temp, dur_out
             )
             out_lens = torch.floor_divide(out_lens, 4)
             out_lens = torch.clamp(out_lens, min=1, max=1000)
-            #print(x.shape)
-            #print(out_lens.shape)
-            #print(out_lens)
 
         return {
             "encoder_out": [x],  # T x B x C
@@ -286,16 +283,11 @@ class TTSTransformerDecoder(FairseqIncrementalDecoder):
         tgt_lengths_extend = None
         if tgt_lengths is not None:
             tgt_lengths_extend = tgt_lengths.repeat_interleave(8)
-            #tgt_lengths_extend = tgt_lengths.repeat_interleave(self.args.decoder_attention_heads)
 
         x = self.prenet(prev_outputs)
         x += self.pos_emb_alpha * positions
         x = self.dropout_module(x)
         
-        #print(x.shape)
-        #print(encoder_out["encoder_out"][0].shape)
-        #print(out_length_pred.shape)
-
         # B x T x C -> T x B x C
         x = x.transpose(0, 1)
 
@@ -311,11 +303,8 @@ class TTSTransformerDecoder(FairseqIncrementalDecoder):
             else:
                 self_attn_mask = None
 
-            #print(encoder_out["encoder_out"][0], flush=True)
-            #print(len(encoder_out["encoder_out"]), flush=True)
-
             # hard coded removal of attn dumping
-            flag = True
+            flag = False
             x, layer_attn, _ = transformer_layer(
                 x,
                 encoder_out["encoder_out"][0]
@@ -507,7 +496,6 @@ class TTSTransformerModel(FairseqEncoderDecoderModel):
         parser.add_argument("--decoder-attention-heads", type=int)
         parser.add_argument("--simple-attention", action="store_true")
         parser.add_argument("--shortened-expt-simil", action="store_true")
-        #parser.add_argument("--cosformer-attn-enable", action="store_true")
         parser.add_argument("--length-pred", action="store_true")
         parser.add_argument("--oracle-length-train", action="store_true")
         parser.add_argument("--enc-cosformer-attn-enable", action="store_true")
@@ -515,8 +503,9 @@ class TTSTransformerModel(FairseqEncoderDecoderModel):
         parser.add_argument("--dec-cross-cosformer-attn-enable", action="store_true")
         parser.add_argument("--enc-simple-attn-enable", action="store_true")
         parser.add_argument("--dec-simple-attn-enable", action="store_true")
-        parser.add_argument("--dec-crwss-simple-attn-enable", action="store_true")
-        parser.add_argument("--dec-expt-simil", action="store_true")
+        parser.add_argument("--dec-cross-simple-attn-enable", action="store_true")
+        parser.add_argument("--var-pred-kernel-size", type=int)
+        parser.add_argument("--var-pred-hidden-dim", type=int)
          
 
     def __init__(self, *args, **kwargs):

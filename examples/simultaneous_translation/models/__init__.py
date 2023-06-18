@@ -6,10 +6,13 @@
 import importlib
 import os
 
+from . import convtransformer_simul_trans
+from . import transformer_monotonic_attention
 
 for file in sorted(os.listdir(os.path.dirname(__file__))):
     if file.endswith(".py") and not file.startswith("_"):
         model_name = file[: file.find(".py")]
+        print(model_name)
         importlib.import_module(
             "examples.simultaneous_translation.models." + model_name
         )

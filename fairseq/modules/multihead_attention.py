@@ -48,10 +48,9 @@ class MultiheadAttention(nn.Module):
         max_src_len_step_size=128,
         shortened_expt_simil=False,
         expt_simil=False,
+        mid_sin_attn_enable=False,
         linear_pos_enable=False,
         linear_pos_layer_num=2,
-        #linear_simul_attn_chkpts=False,
-        #simul_attn_chkpts = Optional[Dict[str, Dict[str, Optional[Tensor]]]
     ):
         super().__init__()
         
@@ -59,7 +58,7 @@ class MultiheadAttention(nn.Module):
         torch.autograd.set_detect_anomaly(True)
         
         # hard-coded ratio for now, currently set to speech to text version
-        self.tgt_len_mod = 1.5
+        #self.tgt_len_mod = 1.5
         #self.tgt_len_mod = 0.6
         self.tgt_len_mod = None
 
@@ -105,19 +104,15 @@ class MultiheadAttention(nn.Module):
         self.expt_simil = expt_simil
         print(f"expt_simil_attention: {self.expt_simil}", flush=True)
 
+        self.mid_sin_attn_enable = mid_sin_attn_enable
+        print(f"Midpoint sinusoid attention: {self.mid_sin_attn_enable}", flush=True)
+
         # generation of additional linear layers, not helpful for non-linear behavior however
         self.linear_pos_enable = linear_pos_enable
         self.linear_pos_layers = nn.ModuleList()
-        #if self.linear_pos_enable:
-        #    for i in range(linear_pos_layer_num):
-        #        self.linear_pos_layers.append(nn.Linear(
     
         # hardcoded for quick iteration
         self.linearized_train = False
-
-        # implemented for quick testing, will add some functionality later
-        # self.linear_simul_attn_chkpts = linear_simul_attn_chkpts
-        self.load_simul_attn_chkpts = {}
 
         assert not self.self_attention or self.qkv_same_dim, (
             "Self-attention requires query, key and " "value to be of the same size"
@@ -316,13 +311,14 @@ class MultiheadAttention(nn.Module):
         oracle_length_train = False,
         src_lengths = None,
         tgt_lengths = None,
+        sin_tr = None,
+        cos_tr = None,
     ):
 
         src_len = k.size(1)
         tgt_len = q.size(1)
         bsz = int(k.size(0) / self.num_heads)
 
-        #print(src_lengths)
 
         # implementation differs from typical key_padding_mask application, but this is useful later and should be fine
         if key_padding_mask is not None:
@@ -336,14 +332,12 @@ class MultiheadAttention(nn.Module):
         idx = torch.arange(1, max_len + 1, device=k.device)
         t_idx = torch.arange(1, max_len + 1, device = k.device).unsqueeze(0).repeat(bsz * self.num_heads, 1).unsqueeze(-1)
       
-        #tgt_lengths = None
-        #print(tgt_lengths)
-        
+
         # transform tensors, use  1 x L x 1 for oracle and bsz*num_heads x L x 1 for length prediction
         if oracle_length_train or out_length_pred is None:
             
             # accounts for problems introduced by padding symbols
-            #print(f"Made it to here {tgt_lengths}", flush=True)
+            # made encoder only changes, will have to change back later
             if tgt_lengths is not None:
                 sin_tr_q = torch.sin((math.pi / 2) * (t_idx[:, :tgt_len, :] / tgt_lengths.unsqueeze(-1).unsqueeze(-1)))
                 cos_tr_q = torch.cos((math.pi / 2) * (t_idx[:, :tgt_len, :] / tgt_lengths.unsqueeze(-1).unsqueeze(-1)))
@@ -383,31 +377,29 @@ class MultiheadAttention(nn.Module):
         k_sin = torch.mul(k, sin_tr_k)
         k_cos = torch.mul(k, cos_tr_k)
 
+        #self.linearized_train = True
+
+        # linearized training turned off by default, can take much longer
         if self.linearized_train:
-            # einsum based approach should be much faster, larger space complexity however
-            # the below expression stores the d x d resulting matrices instead of adding them together, outer product notation
-            kTv_sin_steps = torch.einsum('nld,nlm->nldm', k_sin, v)
-            kTv_cos_steps = torch.einsum('nld,nlm->nldm', k_cos, v)
+            kTv_sin = torch.bmm(k_sin.transpose(1, 2), v)
+            kTv_cos = torch.bmm(k_cos.transpose(1, 2), v)
 
-            kTv_sin_cum = torch.cumsum(kTv_sin_steps, dim=1)
-            kTv_cos_cum = torch.cumsum(kTv_cos_steps, dim=1)
+            norm_sin = torch.sum(k_sin.unsqueeze(-1), dim=1)
+            norm_cos = torch.sum(k_cos.unsqueeze(-1), dim=1)
 
-            attn_weights_sin = torch.einsum('nld,nldm->nlm', q_sin, kTv_sin_cum)
-            attn_weights_cos = torch.einsum('nld,nldm->nlm', q_cos, kTv_cos_cum)
+            # final attn calculations
+            attn_weights_sin = torch.bmm(q_sin, kTv_sin)
+            attn_weights_cos = torch.bmm(q_cos, kTv_cos)
             attn_weights = attn_weights_sin + attn_weights_cos
 
-            # building out normalization
-            norm_sin = torch.cumsum(k_sin, dim=1)
-            norm_cos = torch.cumsum(k_cos, dim=1)
-            
-            prob_norm_sin = torch.bmm(q_sin, norm_sin.transpose(1, 2))
-            prob_norm_cos = torch.bmm(q_cos, norm_cos.transpose(1, 2))
+            prob_norm_sin = torch.bmm(q_sin, norm_sin)
+            prob_norm_cos = torch.bmm(q_cos, norm_cos)
             prob_norm = prob_norm_sin + prob_norm_cos
 
-            prob_norm = torch.diagonal(prob_norm, dim1=1, dim2=2).unsqueeze(-1)
             prob_norm = torch.clamp_min(prob_norm, 0.1)
-            
-            attn = attn_weights / prob_norm
+            attn_probs = attn_weights / prob_norm
+
+            attn = attn_probs
 
         # quadratic doesn't experience a memory bottleneck
         else:
@@ -441,13 +433,6 @@ class MultiheadAttention(nn.Module):
 
             attn = attn_probs / prob_norm
             
-            #print(torch.isnan(attn_weights).any())
-            #print(torch.isnan(attn).any())
-            #print(torch.isnan(prob_norm).any())
-            #print(attn.shape)
-            #print(attn_weights.shape)
-            #print(k.shape)
-
         attn = attn.transpose(0, 1).contiguous().view(tgt_len, bsz, self.embed_dim)
         attn = self.out_proj(attn)
 
@@ -491,7 +476,7 @@ class MultiheadAttention(nn.Module):
 
         elif out_length_pred is not None:
             print("Learned length prediction is engaged.")
-            tgt_len_p = out_length_pred
+            tgt_len_p = 0.8 * out_length_pred
             idx = torch.arange(1, src_len + 1, device = k.device).unsqueeze(0).repeat(bsz * self.num_heads, 1)
         
         elif out_length_lut_pred is not None:
@@ -501,13 +486,9 @@ class MultiheadAttention(nn.Module):
         else:
             idx = torch.arange(1, src_len + 1, device = k.device)
         
-        #print(idx.shape)
-
-        #tgt_len_mod = 1
-        #tgt_len_p = tgt_idx
-        #print(f"Value for tgt_len_p {tgt_len_p}, value for tgt_idx {tgt_idx}")
         # transform tensors
         # need to fix for cross attention
+        tgt_len_mod = None
         if self.self_attention:
             if tgt_len_mod is not None:
                 sin_tr = torch.sin((math.pi / 2) * (idx / tgt_len_p))
@@ -519,11 +500,6 @@ class MultiheadAttention(nn.Module):
             sin_tr = torch.sin((math.pi / 2) * (idx / src_len))
             cos_tr = torch.cos((math.pi / 2) * (idx / src_len))
         
-        #print(sin_tr.shape)
-        
-        #sin_tr = sin_tr.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-        #cos_tr = cos_tr.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-
         # query transforms
         if tgt_len_mod is not None and out_length_pred is None:
             q_sin = torch.mul(q, math.sin((math.pi / 2) * (tgt_idx / tgt_len_p)))
@@ -536,11 +512,6 @@ class MultiheadAttention(nn.Module):
         k_sin = torch.mul(k, sin_tr.unsqueeze(-1))
         k_cos = torch.mul(k, cos_tr.unsqueeze(-1))
         
-        #print("---")
-        #print(q_sin.shape)
-        #print(k_sin.shape)
-        #print("-----")
-
         # construct d x d intermediate matrices and normalization tensors
         kTv_sin = torch.bmm(k_sin.transpose(1, 2), v)
         kTv_cos = torch.bmm(k_cos.transpose(1, 2), v)
@@ -576,6 +547,7 @@ class MultiheadAttention(nn.Module):
 
         return attn, attn_weights
 
+    #@profile
     def cosformer_attn_cache_infer( 
         self,
         q,
@@ -610,30 +582,30 @@ class MultiheadAttention(nn.Module):
             k = k.masked_fill(key_pad_mask_unsqueeze, 0)
             k = k.view(bsz*self.num_heads, src_len, list(k.shape)[3])          
 
-        if tgt_len_mod is not None and out_length_pred is None:
+        # acquire old data
+        attn_block = "self_attn" if self.self_attention else "cross_attn"
+        tgt_len_p = simul_attn_chkpts["layers"][layer_idx][attn_block]["tgt_len_p"]
+        old_attn_weights_v_sin = simul_attn_chkpts["layers"][layer_idx][attn_block]["kTv_sin"]
+        old_attn_weights_v_cos = simul_attn_chkpts["layers"][layer_idx][attn_block]["kTv_cos"]
+        norm_sin_old = simul_attn_chkpts["layers"][layer_idx][attn_block]["norm_sin"]
+        norm_cos_old = simul_attn_chkpts["layers"][layer_idx][attn_block]["norm_cos"]
+
+        if tgt_len_p is None and tgt_len_mod is not None and out_length_pred is None:
             tgt_len_p = torch.tensor([src_idx * tgt_len_mod], device=q.device)
             if src_len is not None:
                 idx = torch.arange(1, src_len + 1, device = k.device)
 
-        elif out_length_pred is not None:
+        elif tgt_len_p is None and out_length_pred is not None:
             #print("Learned length prediction is engaged.")
             tgt_len_p = out_length_pred.unsqueeze(-1).unsqueeze(-1).to(device=q.device)
             if src_len is not None:
                 idx = torch.arange(1, src_len + 1, device = q.device).unsqueeze(0).repeat(bsz * self.num_heads, 1)
         
-        elif out_length_lut_pred is not None:
+        elif tgt_len_p is None and out_length_lut_pred is not None:
             tgt_len_p = out_length_lut_pred.unsqueeze(-1).unsqueeze(-1).to(device=q.device)
             if src_len is not None:
                 idx = torch.arange(1, src_len + 1, device = q.device).unsqueeze(0).repeat(bsz * self.num_heads, 1)
         
-        else:
-            idx = torch.arange(1, src_len + 1, device = k.device)
-        
-        #old_src_idx = simul_attn_chkpts["old_indices"]["src"]
-        #old_tgt_idx = simul_attn_chkpts["old_indices"]["tgt"]
-      
-        #print(q.shape, tgt_idx, tgt_len_p.shape)
-
         q_sin = torch.mul(q, torch.sin((math.pi / 2) * (tgt_idx / tgt_len_p)))
         q_cos = torch.mul(q, torch.cos((math.pi / 2) * (tgt_idx / tgt_len_p)))
 
@@ -643,21 +615,13 @@ class MultiheadAttention(nn.Module):
             k_cos = torch.mul(k, torch.cos((math.pi / 2) * (tgt_idx / tgt_len_p)))
         elif k is not None:
             idx = torch.arange(1, src_len + 1, device = k.device).unsqueeze(0).unsqueeze(-1)
-            src_lengths = src_lengths.unsqueeze(-1).unsqueeze(-1)
+            #src_lengths = src_lengths.unsqueeze(-1).unsqueeze(-1)
             if src_lengths is not None:
                 k_sin = torch.mul(k, torch.sin((math.pi / 2) * (idx / src_lengths)))
                 k_cos = torch.mul(k, torch.cos((math.pi / 2) * (idx / src_lengths)))
             else:
                 k_sin = torch.mul(k, torch.sin((math.pi / 2) * (idx / src_len)))
                 k_cos = torch.mul(k, torch.cos((math.pi / 2) * (idx / src_len)))
-
-
-        # acquire old data
-        attn_block = "self_attn" if self.self_attention else "cross_attn"
-        old_attn_weights_v_sin = simul_attn_chkpts["layers"][layer_idx][attn_block]["kTv_sin"]
-        old_attn_weights_v_cos = simul_attn_chkpts["layers"][layer_idx][attn_block]["kTv_cos"]
-        norm_sin_old = simul_attn_chkpts["layers"][layer_idx][attn_block]["norm_sin"]
-        norm_cos_old = simul_attn_chkpts["layers"][layer_idx][attn_block]["norm_cos"]
 
         # build normalization vectors
         if norm_sin_old is not None and norm_cos_old is not None:
@@ -695,31 +659,19 @@ class MultiheadAttention(nn.Module):
         prob_norm_cos = torch.bmm(q_cos, norm_cos)
         prob_norm = prob_norm_sin + prob_norm_cos
 
-        #prob_norm.expand(list(prob_norm.shape)[0], list(prob_norm.shape)[1], list(attn_weights.shape)[2])
         prob_norm = torch.clamp_min(prob_norm, 0.1)
 
-        #print(attn_weights.shape, prob_norm.shape)
-
-        attn_probs = attn_weights / prob_norm
-
-        attn = attn_probs
-
+        attn = attn_weights / prob_norm
         attn = attn.transpose(0, 1).contiguous().view(tgt_len, bsz, self.embed_dim)
         attn = self.out_proj(attn)
 
-        if self.self_attention:
-            simul_attn_chkpts["layers"][layer_idx]["self_attn"]["kTv_sin"] = attn_weights_v_sin
-            simul_attn_chkpts["layers"][layer_idx]["self_attn"]["kTv_cos"] = attn_weights_v_cos
-            simul_attn_chkpts["layers"][layer_idx]["self_attn"]["norm_sin"] = norm_sin
-            simul_attn_chkpts["layers"][layer_idx]["self_attn"]["norm_cos"] = norm_cos
-        else:
-            simul_attn_chkpts["layers"][layer_idx]["cross_attn"]["kTv_sin"] = attn_weights_v_sin
-            simul_attn_chkpts["layers"][layer_idx]["cross_attn"]["kTv_cos"] = attn_weights_v_cos
-            simul_attn_chkpts["layers"][layer_idx]["cross_attn"]["norm_sin"] = norm_sin
-            simul_attn_chkpts["layers"][layer_idx]["cross_attn"]["norm_cos"] = norm_cos
+        simul_attn_chkpts["layers"][layer_idx][attn_block]["tgt_len_p"] = tgt_len_p
+        simul_attn_chkpts["layers"][layer_idx][attn_block]["kTv_sin"] = attn_weights_v_sin
+        simul_attn_chkpts["layers"][layer_idx][attn_block]["kTv_cos"] = attn_weights_v_cos
+        simul_attn_chkpts["layers"][layer_idx][attn_block]["norm_sin"] = norm_sin
+        simul_attn_chkpts["layers"][layer_idx][attn_block]["norm_cos"] = norm_cos
         
         if need_weights:
-            #print("Turn this shit off for latency-sensitive tests.")
             attn_weights = torch.bmm(q_sin, k_sin.transpose(1, 2)) + torch.bmm(q_cos, k_cos.transpose(1, 2))
             attn_weights = attn_weights / prob_norm
             attn_weights = attn_weights.view(
@@ -833,11 +785,7 @@ class MultiheadAttention(nn.Module):
         attn_weights = torch.bmm(q, attn_weights_v)
 
         prob_norm = torch.bmm(q, norm)
-
-        #prob_norm.expand(list(prob_norm.shape)[0], list(prob_norm.shape)[1], list(attn_weights.shape)[2])
         prob_norm = torch.clamp_min(prob_norm, 0.1)
-
-        #print(attn_weights.shape, prob_norm.shape)
 
         attn_probs = attn_weights / prob_norm
 
@@ -854,7 +802,6 @@ class MultiheadAttention(nn.Module):
             simul_attn_chkpts["layers"][layer_idx]["cross_attn"]["norm_sin"] = norm
         
         if need_weights:
-            print("Turn this shit off for latency-sensitive tests.")
             attn_weights = torch.bmm(q, k.transpose(1, 2)) + torch.bmm(q_cos, k_cos.transpose(1, 2))
             attn_weights = attn_weights / prob_norm
             attn_weights = attn_weights.view(
@@ -863,261 +810,6 @@ class MultiheadAttention(nn.Module):
             if not need_head_weights:
                 # average attention weights over heads
                 attn_weights = attn_weights.mean(dim=0)
-
-        return attn, attn_weights
-
-#    def simple_attn_cache_infer( 
-#        self,
-#        q,
-#        k: Optional[Tensor],
-#        v: Optional[Tensor],
-#        key_padding_mask: Optional[Tensor] = None,
-#        attn_mask: Optional[Tensor] = None,
-#        incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
-#        simul_attn_chkpts: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
-#        layer_idx = None,
-#        tgt_len_mod = None,
-#    ):
-#        old_src_idx = simul_attn_chkpts["old_indices"]["src"]
-#        old_tgt_idx = simul_attn_chkpts["old_indices"]["tgt"]
-#
-#        tgt_idx = incremental_state["steps"]["tgt"]
-#
-#        norm_old = simul_attn_chkpts["layers"][layer_idx]["self_attn"]["norm_cos"]
-#
-#        old_src = tgt_idx - 1
-#
-#        # build normalization vectors if necessary
-#        if norm_old is not None:
-#            norm = norm_old + k.transpose(1, 2)
-#        else:
-#            norm = k.transpose(1, 2)
-#
-#        # build out d x d intermediate matrix
-#        old_kTv = simul_attn_chkpts["layers"][layer_idx]["self_attn"]["kTv_cos"]
-#
-#        if old_kTv is not None:
-#            kTv = torch.bmm(k.transpose(1, 2), v)
-#            kTv = old_kTv + kTv
-#        else:
-#            kTv = torch.bmm(k.transpose(1, 2), v)
-#
-#        # final attention calculation
-#        attn_weights = torch.bmm(q, kTv)
-#
-#        # normalization calculation
-#        prob_norm = torch.bmm(q, norm)
-#        prob_norm = torch.clamp_min(prob_norm, 0.1)
-#
-#        attn_probs = attn_weights / prob_norm
-#
-#        attn = attn_probs
-#
-#        attn = attn.transpose(0, 1).contiguous().view(1, 1, self.embed_dim)
-#        attn = self.out_proj(attn)
-#
-#        simul_attn_chkpts["layers"][layer_idx]["self_attn"]["norm_cos"] = norm
-#        simul_attn_chkpts["layers"][layer_idx]["self_attn"]["kTv_cos"] = kTv
-#
-#        return attn, attn_weights
-    
-    def expt_attn_baseline_train(
-        self,
-        q,
-        k: Optional[Tensor],
-        v: Optional[Tensor],
-        key_padding_mask: Optional[Tensor] = None,
-        attn_mask: Optional[Tensor] = None,
-        incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
-        simul_attn_chkpts: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
-        need_weights = False,
-        need_head_weights = False,
-        layer_idx = None,
-        is_tpu = False,
-    ):
-
-        src_len = k.size(1)
-        tgt_len = q.size(1)
-        bsz = int(k.size(0) / self.num_heads)
-
-        # implementation differs from typical key_padding_mask application, but this is useful later and should be fine
-        if key_padding_mask is not None:
-            key_pad_mask_unsqueeze = key_padding_mask.unsqueeze(1).unsqueeze(-1).to(torch.bool)
-            k = k.view(bsz, self.num_heads, src_len, list(k.shape)[2])          
-            k = k.masked_fill(key_pad_mask_unsqueeze, 0)
-            k = k.view(bsz*self.num_heads, src_len, list(k.shape)[3])          
-           
-        # begin setup and transformations   
-        max_len = max(src_len, tgt_len)
-        #q_sin_init = q
-        #_cos_init = q
-        #k_sin_init = k
-        #k_cos_init = k
-        #q_sin = torch.zeros(q.shape, device=q.device)
-        #q_cos = torch.zeros(q.shape, device=q.device)
-        #k_sin = torch.zeros(k.shape, device=k.device)
-        #k_cos = torch.zeros(k.shape, device=k.device)
-        idx = torch.arange(1, max_len + 1, device=k.device)
-        q_t = q
-        q_tt = q
-        k_t = k
-        k_tt = k
-        norm = torch.zeros(list(k.shape)[0], list(k.shape)[2], 1, device=k.device)
-        norm_tr = torch.zeros(list(k.shape)[0], list(k.shape)[2], 1, device=k.device)
-        
-        # transform tensors, set M for length vs. no length tests
-        a = 25
-        M = tgt_len / 4
-        #M = 1
-        i_tr = torch.exp(-1 * idx[:tgt_len] / (a * M)).unsqueeze(0).unsqueeze(-1)
-        #i_ttr = torch.exp(-2 * idx[:tgt_len] / M)
-        j_tr = torch.exp(idx[:src_len] / (a * M)).unsqueeze(0).unsqueeze(-1)
-        #j_ttr = torch.exp(-2 * idx[:src_len] / M)
-        # query transforms
-        q_tr = torch.mul(q, i_tr)
-        #q_ttr = torch.mul(q, i_ttr)
-
-        # key transforms
-        k_tr = torch.mul(q, j_tr)
-        #k_ttr = torch.mul(q, j_ttr)
-       
-        # not updated for now, unnecessary as we are never training linearly
-        if self.linearized_train:
-            # einsum based approach should be much faster, larger space complexity however
-            # the below expression stores the d x d resulting matrices instead of adding them together, outer product notation
-            kTv_sin_steps = torch.einsum('nld,nlm->nldm', k_sin, v)
-            kTv_cos_steps = torch.einsum('nld,nlm->nldm', k_cos, v)
-
-            kTv_sin_cum = torch.cumsum(kTv_sin_steps, dim=1)
-            kTv_cos_cum = torch.cumsum(kTv_cos_steps, dim=1)
-
-            attn_weights_sin = torch.einsum('nld,nldm->nlm', q_sin, kTv_sin_cum)
-            attn_weights_cos = torch.einsum('nld,nldm->nlm', q_cos, kTv_cos_cum)
-            attn_weights = attn_weights_sin + attn_weights_cos
-
-            # building out normalization
-            norm_sin = torch.cumsum(k_sin, dim=1)
-            norm_cos = torch.cumsum(k_cos, dim=1)
-            
-            prob_norm_sin = torch.bmm(q_sin, norm_sin.transpose(1, 2))
-            prob_norm_cos = torch.bmm(q_cos, norm_cos.transpose(1, 2))
-            prob_norm = prob_norm_sin + prob_norm_cos
-
-            prob_norm = torch.diagonal(prob_norm, dim1=1, dim2=2).unsqueeze(-1)
-            prob_norm = torch.clamp_min(prob_norm, 0.1)
-            
-            attn = attn_weights / prob_norm
-
-        # quadratic doesn't experience a memory bottleneck
-        else:
-            #attn_weights_b = torch.bmm(q, k.transpose(1, 2))
-            #attn_weights_ijt = torch.bmm(q_tr, k_tr.transpose(1, 2))
-            #attn_weights = attn_weights_b - attn_weights_ijt
-            attn_weights = torch.bmm(q_tr, k_tr.transpose(1, 2))
-
-            if attn_mask is not None:
-                attn_mask_bool = attn_mask.to(torch.bool)
-                attn_weights = attn_weights.masked_fill(attn_mask_bool, 0)
-           
-            attn_weights = self.dropout_module(attn_weights)
-            attn_probs = torch.bmm(attn_weights, v)
-
-            # section to try and replicate casual relationship in normalization
-            if attn_mask is not None:
-                norm = torch.cumsum(k, dim=1).transpose(1, 2)
-                norm_tr = torch.cumsum(k_tr, dim=1).transpose(1, 2)
-            else:
-                norm = torch.sum(k, dim=1).unsqueeze(-1)
-                norm_tr = torch.sum(k_tr, dim=1).unsqueeze(-1)
-            
-            #prob_norm = torch.bmm(q, norm)
-            #prob_norm_tr = torch.bmm(q_tr, norm_tr)
-            #prob_norm = prob_norm + prob_norm_tr
-            prob_norm = torch.bmm(q_tr, norm_tr)
-
-            if attn_mask is not None:
-                prob_norm = torch.diagonal(prob_norm, dim1=1, dim2=2).unsqueeze(-1)
-
-            prob_norm = torch.clamp_min(prob_norm, 0.1)
-
-
-            attn = attn_probs / prob_norm
-            #print("Information of interest.", flush=True)
-            #print(torch.isnan(attn_probs).any(), flush=True)
-            #print(torch.isnan(prob_norm).any(), flush=True)
-            #print(torch.isnan(attn).any(), flush=True)
-
-            #print(torch.isnan(attn_weights).any())
-            #print(torch.isnan(attn).any())
-            #print(torch.isnan(prob_norm).any())
-            #print(attn.shape)
-            #print(attn_weights.shape)
-            #print(k.shape)
-
-        attn = attn.transpose(0, 1).contiguous().view(tgt_len, bsz, self.embed_dim)
-        attn = self.out_proj(attn)
-
-        return attn, attn_weights
-    
-    def expt_attn_baseline_infer(
-        self,
-        q,
-        k: Optional[Tensor],
-        v: Optional[Tensor],
-        key_padding_mask: Optional[Tensor] = None,
-        attn_mask: Optional[Tensor] = None,
-        incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
-        simul_attn_chkpts: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
-        tgt_len_mod = None,
-        out_length_pred: Optional[Tensor] = None,
-    ):
-        
-        src_idx = incremental_state["steps"]["src"]
-        tgt_idx = incremental_state["steps"]["tgt"]
-
-        bsz = int(k.size(0) / self.num_heads)
-        src_len = k.size(1)
-        tgt_len = q.size(1)
-
-        if tgt_len_mod is not None:
-            tgt_len_p = src_idx * self.tgt_len_mod
-
-        elif out_length_pred is not None:
-            tgt_len_p = out_length_pred
-
-        else:
-            tgt_len_p = 1
-
-        idx = torch.arange(1, src_len + 1, device = k.device).unsqueeze(0).repeat(bsz * self.num_heads, 1)
-        
-        # transform tensors, set M for length vs. no length tests
-        # self attention assumed for now
-        a = 25
-        M = tgt_len.unsqueeze(-1) / 4
-        #M = 1
-        j_tr = torch.exp(idx[:src_len] / (a * M)).unsqueeze(0).unsqueeze(-1)
-
-        # query transforms
-        q_tr = torch.mul(q, torch.exp(-1 * tgt_idx / (a * M)))
-        
-        # key transforms
-        k_tr = torch.mul(k, j_tr.unsqueeze(-1))
-
-        # construct d x d intermediate matrices and normalization tensors
-        kTv_tr = torch.bmm(k_tr.transpose(1, 2), v)
-
-        norm_tr = torch.sum(k_tr.unsqueeze(-1), dim=1)
-
-        # final attn calculations
-        attn_weights = torch.bmm(q_tr, kTv_tr)
-        prob_norm_sin = torch.bmm(q_tr, norm_tr)
-
-        prob_norm = torch.clamp_min(prob_norm, 0.1)
-        attn_probs = attn_weights / prob_norm
-
-        attn = attn_probs
-        attn = attn.transpose(0, 1).contiguous().view(tgt_len, bsz, self.embed_dim)
-        attn = self.out_proj(attn)
 
         return attn, attn_weights
 
@@ -1141,6 +833,8 @@ class MultiheadAttention(nn.Module):
         oracle_length_train = None,
         src_lengths = None,
         tgt_lengths = None,
+        sin_tr = None,
+        cos_tr = None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """Input shape: Time x Batch x Channel
 
@@ -1299,17 +993,17 @@ class MultiheadAttention(nn.Module):
                 .transpose(0, 1)
             )
 
-        #print(key_padding_mask is None)
-        #print(k.size())
+        
+        # for self-attention, we don't need to recall previous keys, for cross attention we only need the keys and values once
         if self.cosformer_attn_enable and self.self_attention:
             if incremental_state is not None:
                 if simul_attn_chkpts is not None:
                     return self.cosformer_attn_cache_infer(q, k, v, key_padding_mask, attn_mask, incremental_state, simul_attn_chkpts, need_weights, need_head_weights, layer_idx, self.tgt_len_mod, out_length_pred, out_length_lut_pred, src_lengths)
 
-#        if self.cosformer_attn_enable and not self.self_attention:
-#            if incremental_state is not None:
-#                if simul_attn_chkpts is not None and simul_attn_chkpts["layers"][layer_idx]["cross_attn"]["kTv_cos"] is not None:
-#                    return self.cosformer_attn_cache_infer(q, k, v, key_padding_mask, attn_mask, incremental_state, simul_attn_chkpts, need_weights, need_head_weights, layer_idx, self.tgt_len_mod, out_length_pred, out_length_lut_pred, src_lengths)
+        if self.cosformer_attn_enable and not self.self_attention:
+            if incremental_state is not None:
+                if simul_attn_chkpts is not None and simul_attn_chkpts["layers"][layer_idx]["cross_attn"]["kTv_cos"] is not None:
+                    return self.cosformer_attn_cache_infer(q, k, v, key_padding_mask, attn_mask, incremental_state, simul_attn_chkpts, need_weights, need_head_weights, layer_idx, self.tgt_len_mod, out_length_pred, out_length_lut_pred, src_lengths)
 
         if self.simple_attention and self.self_attention:
             if incremental_state is not None:
@@ -1393,26 +1087,22 @@ class MultiheadAttention(nn.Module):
                     dim=1,
                 )
 
+        # hardcoded for now, need to fix later
         self.tgt_len_mod = 1.625
-        #print(f"Ratio present here {self.tgt_len_mod}")
-        #print(f"Ratio present here 'is off'")
-        #if self.cosformer_attn_enable and self.self_attention:
-        # cross attn for first step
         if self.cosformer_attn_enable and not self.self_attention:
             if incremental_state is not None:
-                #if simul_attn_chkpts is not None and simul_attn_chkpts["layers"][layer_idx]["cross_attn"]["kTv_cos"] is None:
                 if simul_attn_chkpts is not None:
                     return self.cosformer_attn_cache_infer(q, k, v, key_padding_mask, attn_mask, incremental_state, simul_attn_chkpts, need_weights, need_head_weights, layer_idx, self.tgt_len_mod, out_length_pred, out_length_lut_pred, src_lengths)
-       
+
+
         # training and baseline inference, inefficient and we prefer data reuse
         if self.cosformer_attn_enable:
             if incremental_state is not None:
-                #if simul_attn_chkpts is not None:
-                #    return self.cosformer_attn_cache_infer(q, k, v, key_padding_mask, attn_mask, incremental_state, simul_attn_chkpts, layer_idx, tgt_len_mod)
-                #else:
                 return self.cosformer_attn_baseline_infer(q, k, v, key_padding_mask, attn_mask, incremental_state, simul_attn_chkpts, need_weights, need_head_weights, self.tgt_len_mod, out_length_pred, out_length_lut_pred, src_lengths)
             else:
-                return self.cosformer_attn_baseline_train(q, k, v, key_padding_mask, attn_mask, incremental_state, simul_attn_chkpts, need_weights, need_head_weights, out_length_pred, oracle_length_train, src_lengths, tgt_lengths)
+                return self.cosformer_attn_baseline_train(q, k, v, key_padding_mask, attn_mask, incremental_state, simul_attn_chkpts, need_weights, need_head_weights, out_length_pred, oracle_length_train, src_lengths, tgt_lengths, sin_tr, cos_tr)
+
+
 
         # cross attn for first step
         if self.simple_attention and not self.self_attention:
@@ -1420,39 +1110,10 @@ class MultiheadAttention(nn.Module):
                 if simul_attn_chkpts is not None and simul_attn_chkpts["layers"][layer_idx]["cross_attn"]["kTv_sin"] is None:
                     return self.simple_attn_cache_infer(q, k, v, key_padding_mask, attn_mask, incremental_state, simul_attn_chkpts, need_weights, need_head_weights, layer_idx, self.tgt_len_mod, out_length_pred, out_length_lut_pred, src_lengths)
         
-        #if self.simple_attention and self.self_attention:
         if self.simple_attention:
             if incremental_state is not None:
                 return self.simple_attn_baseline_infer(q, k, v, key_padding_mask, attn_mask, incremental_state, simul_attn_chkpts, need_weights, need_head_weights, self.tgt_len_mod)
 
-        if self.expt_simil:
-            return self.expt_attn_baseline_train(q, k, v, key_padding_mask, attn_mask, incremental_state, simul_attn_chkpts, need_weights)
-
-        # quick test for small similarity function addition
-        if self.shortened_expt_simil and self.self_attention:
-            idx = torch.arange(1, src_len + 1, device=k.device)
-            if incremental_state is not None:
-                tgt_idx = src_len - 1
-            else:
-                tgt_idx = 0
-            i_tr = torch.exp(-1/128 * idx[tgt_idx:src_len])
-            j_tr = torch.exp(1/128 * idx[:src_len])
-            
-            i_tr = i_tr.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-            j_tr = j_tr.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-
-            q = torch.matmul(q.unsqueeze(-1), i_tr).squeeze(-1)
-            k = torch.matmul(k.unsqueeze(-1), j_tr).squeeze(-1)
-
-        # cosFormer implementation alongside some alternative decomposable similarity functions 
-        #if self.cosformer_attn_enable or self.cosformer_expt_attn_enable and self.self_attention:
-        #    return self.cosformer_attn_train_and_infer(q, k, v, src_len, bsz, key_padding_mask, attn_mask, incremental_state, simul_attn_chkpts, layer_idx, is_tpu)
-        #elif self.combin_attn_enable or self.combin_expt_attn_enable and self.self_attention:
-        #    return self.combin_attn_train_and_infer(q, k, v, src_len, bsz, key_padding_mask, attn_mask, incremental_state, simul_attn_chkpts, layer_idx, is_tpu)
-
-        #if not self.self_attention:
-        #    print(f"Sizing information of interest: bsz {q.size(0)}, target {q.size(1)}, source {k.size(1)}")
-        
         attn_weights = torch.bmm(q, k.transpose(1, 2))
         attn_weights = self.apply_sparse_mask(attn_weights, tgt_len, src_len, bsz)
 
@@ -1493,7 +1154,6 @@ class MultiheadAttention(nn.Module):
         if self.simple_attention:
             attn_weights_float = attn_weights.type(torch.float32)
             denom = torch.clamp_min(attn_weights_float.sum(dim=-1, keepdim=True), 0.1)
-            #print(f"Denom: {denom}", flush=True)
             attn_weights_float = attn_weights_float / denom
         else:
             attn_weights_float = utils.softmax(

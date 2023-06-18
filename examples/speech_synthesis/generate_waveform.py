@@ -267,7 +267,6 @@ def main(args):
                     dataset, sample, hypos, resample_fn, args.dump_target
             ):
                 dump_result(is_na_model, args, vocoder, *result)
-    
     logger.info(f"Inference is finished.")
 
 def cli_main():

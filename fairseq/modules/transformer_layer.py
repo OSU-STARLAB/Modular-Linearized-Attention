@@ -177,6 +177,8 @@ class TransformerEncoderLayerBase(nn.Module):
         x,
         encoder_padding_mask: Optional[Tensor],
         src_lengths = None,
+        sin_tr = None,
+        cos_tr = None,
         attn_mask: Optional[Tensor] = None,
     ):
         """
@@ -216,6 +218,8 @@ class TransformerEncoderLayerBase(nn.Module):
             attn_mask=attn_mask,
             src_lengths=src_lengths,
             tgt_lengths=src_lengths,
+            sin_tr=sin_tr,
+            cos_tr=cos_tr,
         )
         #print(f"Encoder self-attn shape: {x.shape}")
         x = self.dropout_module(x)
@@ -379,15 +383,12 @@ class TransformerDecoderLayerBase(nn.Module):
             q_noise=self.quant_noise,
             qn_block_size=self.quant_noise_block_size,
             simple_attention=cfg.dec_simple_attn_enable,
-            cosformer_attn_enable=(cfg.dec_cosformer_attn_enable or cfg.cosformer_attn_enable),
-            expt_simil=cfg.dec_expt_simil,
+            cosformer_attn_enable=cfg.dec_cosformer_attn_enable,
             cosformer_expt_attn_enable=cfg.cosformer_expt_attn_enable,
             combin_attn_enable=cfg.combin_attn_enable,
             combin_expt_attn_enable=cfg.combin_expt_attn_enable,
             enable_norm_stretch_factor=(not cfg.disable_norm_stretch_factor),
             max_src_len_step_size=cfg.max_src_len_step_size,
-            shortened_expt_simil=cfg.shortened_expt_simil,
-            #cosformer_attn_enable=cfg.cosformer_attn_enable,
         )
 
     def build_encoder_attention(self, embed_dim, cfg):
@@ -401,8 +402,8 @@ class TransformerDecoderLayerBase(nn.Module):
             q_noise=self.quant_noise,
             qn_block_size=self.quant_noise_block_size,
             cosformer_attn_enable=cfg.dec_cross_cosformer_attn_enable,
+            mid_sin_attn_enable=cfg.mid_sin_attn_enable,
             simple_attention=cfg.dec_cross_simple_attn_enable,
-            #cosformer_attn_enable=cfg.cosformer_attn_enable,
         )
 
     def prepare_for_onnx_export_(self):
@@ -430,6 +431,8 @@ class TransformerDecoderLayerBase(nn.Module):
         layer_idx = None,
         src_lengths = None,
         tgt_lengths = None,
+        sin_tr = None,
+        cos_tr = None,
     ):
         """
         Args:
@@ -538,7 +541,7 @@ class TransformerDecoderLayerBase(nn.Module):
                 simul_attn_chkpts=simul_attn_chkpts,
                 layer_idx=layer_idx,
                 static_kv=True,
-                need_weights=need_attn or (not self.training and self.need_attn),
+                need_weights=need_attn or (not self.training and self.need_attn and False),
                 need_head_weights=need_head_weights,
                 out_length_pred=out_length_pred,
                 out_length_lut_pred=out_length_lut_pred,

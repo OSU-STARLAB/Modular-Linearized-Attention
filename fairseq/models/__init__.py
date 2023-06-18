@@ -233,3 +233,7 @@ def import_models(models_dir, namespace):
 # automatically import any Python files in the models/ directory
 models_dir = os.path.dirname(__file__)
 import_models(models_dir, "fairseq.models")
+
+# manual fix attempted for simultaneous_translation
+#simul_models_dir = os.path.dirname(__file__)
+#import_models(simul_models_dir, "examples.simultaneous_translation.models")

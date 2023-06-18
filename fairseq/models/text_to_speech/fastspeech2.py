@@ -38,7 +38,7 @@ def Embedding(num_embeddings, embedding_dim, padding_idx=None):
     nn.init.normal_(m.weight, mean=0, std=embedding_dim**-0.5)
     return m
 
-
+# small change, just type casts to int for padding
 class PositionwiseFeedForward(nn.Module):
     def __init__(self, in_dim, hidden_dim, kernel_size, dropout):
         super().__init__()
@@ -47,14 +47,14 @@ class PositionwiseFeedForward(nn.Module):
                 in_dim,
                 hidden_dim,
                 kernel_size=kernel_size,
-                padding=(kernel_size - 1) // 2,
+                padding=int(kernel_size / 2),
             ),
             nn.ReLU(),
             nn.Conv1d(
                 hidden_dim,
                 in_dim,
                 kernel_size=kernel_size,
-                padding=(kernel_size - 1) // 2,
+                padding=int(kernel_size / 2),
             ),
         )
         self.layer_norm = LayerNorm(in_dim)
@@ -122,7 +122,7 @@ class VariancePredictor(nn.Module):
                 args.encoder_embed_dim,
                 args.var_pred_hidden_dim,
                 kernel_size=args.var_pred_kernel_size,
-                padding=(args.var_pred_kernel_size - 1) // 2,
+                padding=int(args.var_pred_kernel_size / 2),
             ),
             nn.ReLU(),
         )
@@ -135,7 +135,7 @@ class VariancePredictor(nn.Module):
                 args.var_pred_hidden_dim,
                 args.var_pred_hidden_dim,
                 kernel_size=args.var_pred_kernel_size,
-                padding=1,
+                padding=int(args.var_pred_kernel_size / 2),
             ),
             nn.ReLU(),
         )
@@ -150,6 +150,53 @@ class VariancePredictor(nn.Module):
         x = self.dropout_module(self.ln2(x))
         return self.proj(x).squeeze(dim=2)
 
+class LargeVariancePredictor(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        self.conv1 = nn.Sequential(
+            nn.Conv1d(
+                args.encoder_embed_dim,
+                args.var_pred_hidden_dim,
+                kernel_size=args.var_pred_kernel_size,
+                padding=int(args.var_pred_kernel_size / 2),
+            ),
+            nn.ReLU(),
+        )
+        self.ln1 = nn.LayerNorm(args.var_pred_hidden_dim)
+        self.dropout_module = FairseqDropout(
+            p=args.var_pred_dropout, module_name=self.__class__.__name__
+        )
+        self.conv2 = nn.Sequential(
+            nn.Conv1d(
+                args.var_pred_hidden_dim,
+                args.var_pred_hidden_dim,
+                kernel_size=args.var_pred_kernel_size,
+                padding=int(args.var_pred_kernel_size / 2),
+            ),
+            nn.ReLU(),
+        )
+        self.ln2 = nn.LayerNorm(args.var_pred_hidden_dim)
+        self.conv3 = nn.Sequential(
+            nn.Conv1d(
+                args.var_pred_hidden_dim,
+                args.var_pred_hidden_dim,
+                kernel_size=args.var_pred_kernel_size,
+                padding=int(args.var_pred_kernel_size / 2),
+            ),
+            nn.ReLU(),
+        )
+        self.ln3 = nn.LayerNorm(args.var_pred_hidden_dim)
+        self.proj = nn.Linear(args.var_pred_hidden_dim, 1)
+
+    def forward(self, x):
+        # Input: B x T x C; Output: B x T
+        x = self.conv1(x.transpose(1, 2)).transpose(1, 2)
+        x = self.dropout_module(self.ln1(x))
+        x = self.conv2(x.transpose(1, 2)).transpose(1, 2)
+        x = self.dropout_module(self.ln2(x))
+        x = self.conv3(x.transpose(1, 2)).transpose(1, 2)
+        x = self.dropout_module(self.ln3(x))
+        return self.proj(x).squeeze(dim=2)
 
 class VarianceAdaptor(nn.Module):
     def __init__(self, args):

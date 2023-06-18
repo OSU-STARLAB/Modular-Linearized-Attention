@@ -187,6 +187,8 @@ class ConvTransformerModel(FairseqEncoderDecoderModel):
             action="store_true",
             help="if True, use simple attention without softmax as proposed by https://arxiv.org/pdf/2111.15588.pdf",
         )
+        # added quickly
+        parser.add_argument("--dec-simple-attn-enable", action="store_true")
         # VA, cosFormer support
         parser.add_argument(
             "--cosformer-attn-enable",

@@ -142,6 +142,7 @@ class AutoRegressiveSpeechGenerator(SpeechGenerator):
             simul_attn_chkpts["layers"][i] = {}
             simul_attn_chkpts["layers"][i]["self_attn"] = {}
             simul_attn_chkpts["layers"][i]["cross_attn"] = {}
+            simul_attn_chkpts["layers"][i]["self_attn"]["tgt_len_p"] = None
             simul_attn_chkpts["layers"][i]["self_attn"]["norm_sin"] = None
             simul_attn_chkpts["layers"][i]["self_attn"]["norm_cos"] = None
             simul_attn_chkpts["layers"][i]["self_attn"]["k_sin"] = None
@@ -149,6 +150,7 @@ class AutoRegressiveSpeechGenerator(SpeechGenerator):
             simul_attn_chkpts["layers"][i]["self_attn"]["v"] = None
             simul_attn_chkpts["layers"][i]["self_attn"]["kTv_sin"] = None
             simul_attn_chkpts["layers"][i]["self_attn"]["kTv_cos"] = None
+            simul_attn_chkpts["layers"][i]["cross_attn"]["tgt_len_p"] = None
             simul_attn_chkpts["layers"][i]["cross_attn"]["norm_sin"] = None
             simul_attn_chkpts["layers"][i]["cross_attn"]["norm_cos"] = None
             simul_attn_chkpts["layers"][i]["cross_attn"]["k_sin"] = None
